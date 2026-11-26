@@ -13,3 +13,4 @@ node_modules/
 config.json
 
 # 计划书为交接文档，保留；如日后不想公开可移除这行
+.npmrc
