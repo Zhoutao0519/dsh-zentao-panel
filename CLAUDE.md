@@ -34,6 +34,7 @@ node test/weekly.mjs                         # 周报纯函数/服务/RPC/docx �
 node test/trae-prompt.mjs                    # Trae purpose 提示词 + RPC 渠道（纯函数）
 node test/multi.mjs                          # 多账号：迁移/切换/缓存隔离/移除（mock client，不打网络）
 node test/protocol.mjs                       # 禅道响应信封协议 + 自动重登（stub fetch，不打网络）
+node test/route.mjs                          # host RPC 路由挂载/残留接管/清理（mock webServer，不打网络）
 DSH_HOME=/tmp/zt-smoke node test/smoke.mjs   # 直连真实禅道验证 client/service 层（需内网可达）
 DSH_HOME=/tmp/zt-host  node test/host.mjs    # apply() + RPC wire 协议端到端（mock ctx）
 ```
@@ -88,6 +89,7 @@ dsh-zentao-panel/
     ├── trae-prompt.mjs  # Trae purpose 提示词 + 渠道一致性
     ├── multi.mjs        # 多账号（mock client，不打网络）
     ├── protocol.mjs     # 禅道响应信封协议 + 自动重登（stub fetch，不打网络）
+    ├── route.mjs        # host RPC 路由挂载/残留接管/清理（mock webServer）
     └── client.mjs       # client 半边注册契约（免渲染）
 ```
 
@@ -173,6 +175,16 @@ client-modules: <pkg> declares dsh.client but exports no "./client" bundle
 这个错误**只打在 host 启动日志的 warn 里**（`flush(err => ctx.logger.warn(err))`），该插件被静默 drop——**浏览器 console 一个错都没有**，表现就是「插件完全不存在」。修复：`exports` 必须有 `"./client": "./client/client.js"`（可用 string 或 `{default: string}`）。改完必须**重启桌面版**：client-module 表只在 boot 时组合，失败过的包不会被 HMR 收编。
 
 **验证 client bundle 是否被服务的办法**：`curl -X POST http://127.0.0.1:<dsh端口>/dsh-ztp9-rpc/zentao.status`——返回 **401**（信任栅栏拒绝）说明 host 路由已挂载；返回 404/405 说明插件没加载。端口用 `lsof -nP -iTCP -sTCP:LISTEN | grep DeepSeek` 找（桌面版是 127.0.0.1 高位端口，3081 是 dsh-pocket 代理）。
+
+**⚠️ 路由重复挂载（2026-11-26 真机）**：DSH `webServer.register` 对同一 `(kind,path)` 零容忍，第二次直接
+throw `webserver: duplicate prefix route`。宿主热重载插件（HMR / 插件管理器里重装、禁用再启用）不保证先跑完
+上一次 apply 的清理——旧 fiber 或旧 ESM 模块缓存还在时，新一次 apply 会撞上自己上一次挂的 `/dsh-ztp9-rpc`，
+表现为插件管理器「1 异常 / duplicate prefix route」、面板不可用，**只能重启 DSH Desktop 才好**
+（历史上反复换通道名 `/dsh-zentao-panel` → `/dsh-zentao-rpc` → `/dsh-ztp-rpc` … → `/dsh-ztp9-rpc` 就是在躲它）。
+`lib/rpc.mjs` 现已自愈：进程级 `Symbol.for('dsh-zentao-panel.route-owners')` 表登记本插件挂过的清理函数，
+新实例 apply 先回收上一次；撞上更早版本的僵尸路由就从 `webServer.prefixes`（HostWebServer 内部 Map）摘掉重挂；
+注册优先走 `ctx.effect(...)`（官方 connection 通道同款，随插件 fiber 释放），清理时按路由对象身份判断，
+旧实例清理晚到也不会误删新路由；实在回收不了才抛「请重启 DSH Desktop」。回归：`node test/route.mjs`。
 
 **composer DOM**：`[data-composer-input]`（contenteditable，Lexical 受控）。写法必须 `execCommand('insertText')`（选中全部内容后），失败兜底 `textContent + input 事件`——dsh-rewind-plugin 的 `fillComposerEditable` 原样照抄。`data-composer-card` / `data-composer-seat` 是外围挂点。
 
