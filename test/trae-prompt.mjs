@@ -6,7 +6,10 @@
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildTraePrompt, TRAE_PURPOSES } from '../lib/trae.mjs';
+import {
+  appendImageList, buildTraePrompt, collectImageRefs, createTraeService,
+  stripImageMarkers, TRAE_PURPOSES,
+} from '../lib/trae.mjs';
 import { CHANNEL } from '../lib/rpc.mjs';
 import { apply } from '../lib/index.js';
 
@@ -49,6 +52,87 @@ check('未知 purpose 回落 fix（改代码文案）', unknown.includes('定位
 check('未传 purpose 默认 fix', buildTraePrompt().includes('定位并修改代码'));
 check('TRAE_PURPOSES 只含四种已实现目的', TRAE_PURPOSES.size === 4
   && ['fix', 'testcases', 'test-analysis', 'requirement-review'].every((p) => TRAE_PURPOSES.has(p)));
+
+// ── 详情 / 关联需求里的图片（2026-11-26）：必须随任务一起带到 Trae ──────────
+const imageUrl = (id) => `http://zt.example.com/file-read-${id}.png`;
+{
+  const calls = [];
+  const fakeZentao = {
+    async fetchDetailFor(accountId, kind, id) {
+      calls.push(`${kind}:${id}:${accountId}`);
+      if (kind === 'task' && Number(id) === 1) {
+        return {
+          id: 1,
+          title: '任务一',
+          desc: '任务正文 [图片：111.png]',
+          images: [{ url: imageUrl(111), name: '111.png' }],
+          actions: [{
+            date: '2026-11-20 10:00', desc: '备注',
+            comment: '看这个 [图片：222.png]',
+            images: [{ url: imageUrl(222), name: '222.png' }],
+          }],
+          storyId: 9,
+          storyTitle: '需求九',
+        };
+      }
+      if (kind === 'story' && Number(id) === 9) {
+        return {
+          id: 9,
+          title: '需求九',
+          desc: '需求正文 [图片：333.png]',
+          images: [
+            { url: imageUrl(333), name: '333.png' },
+            { url: imageUrl(111), name: '111.png' }, // 与任务详情重复：必须去重
+          ],
+        };
+      }
+      return null;
+    },
+  };
+  const trae = createTraeService({
+    getZentao: () => fakeZentao,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const enriched = await trae.enrich({
+    cards: [{ kind: 'task', id: 1 }],
+    md: '## 禅道任务 #1：任务一',
+    accountId: 'acct',
+  });
+  const urls = enriched.images.map((x) => x.url);
+  check('enrich：详情 + 关联需求图片按出现顺序带回', urls.length === 3
+    && urls[0] === imageUrl(111) && urls[1] === imageUrl(222) && urls[2] === imageUrl(333),
+  urls.join(' , '));
+  check('enrich：图片按 url 去重', new Set(urls).size === urls.length);
+  check('enrich：md 去掉 [图片：…] 占位标记', !enriched.md.includes('[图片'));
+  check('enrich：需求正文文字保留', enriched.md.includes('需求正文'));
+  check('enrich：按账号读取任务 + 关联需求详情', calls.join(',') === 'task:1:acct,story:9:acct', calls.join(','));
+
+  const storyOnly = await trae.enrich({
+    cards: [{ kind: 'story', id: 9 }],
+    md: '## 禅道需求 #9：需求九',
+    accountId: 'acct',
+  });
+  check('enrich：需求卡自己详情的图片也带回', storyOnly.images.length >= 1
+    && storyOnly.images[0].url === imageUrl(333));
+
+  const noService = createTraeService({ getZentao: () => null, logger: { info() {}, warn() {}, error() {} } });
+  const empty = await noService.enrich({ cards: [{ kind: 'task', id: 1 }], md: 'x', accountId: 'acct' });
+  check('enrich：拿不到禅道服务时 images 仍是空数组', Array.isArray(empty.images) && empty.images.length === 0);
+
+  // 纯合并逻辑：客户端图 + enrich 图 去重保序（host 下载前就是这么拼的）
+  const merged = [];
+  const seen = new Set();
+  collectImageRefs(merged, seen, [{ url: imageUrl(111), name: '111.png' }]);
+  collectImageRefs(merged, seen, enriched.images);
+  check('合并：客户端图在前、enrich 图补后、整体去重', merged.length === 3
+    && merged[0].url === imageUrl(111) && merged[2].url === imageUrl(333));
+}
+
+check('stripImageMarkers：清掉占位标记与空行', stripImageMarkers('正文[图片：1.png]\n\n\n下一段')
+  === '正文\n\n下一段');
+check('appendImageList：列出截图附件', appendImageList('正文', ['1-a.png', '2-b.png'])
+  .includes('## 截图附件') && appendImageList('正文', ['1-a.png']).includes('1-a.png'));
+check('appendImageList：无图时不加小节', appendImageList('正文', []) === '正文');
 
 // ── RPC 渠道一致性（防止 client / host 渠道漂移）──────────────────
 check('host RPC 渠道为 /dsh-ztp9-rpc', CHANNEL === '/dsh-ztp9-rpc', CHANNEL);

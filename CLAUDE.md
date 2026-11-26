@@ -79,6 +79,7 @@ dsh-zentao-panel/
 │   ├── weekly.mjs       # 周报纯函数（接口字段口径/过滤/模板/日期）
 │   ├── docx-exporter.mjs# 周报导出（docx；缺依赖回退 Word 兼容 .doc）
 │   ├── store.mjs        # ~/.dsh/zentao-panel/config.json 持久化（0600，schema v2）
+│   ├── trae.mjs         # 本机 Trae CN 下发（探测/桥接/task.md + 详情与关联需求截图）
 │   └── rpc.mjs          # /dsh-ztp9-rpc loopback RPC（wire 协议复刻 dsh-pocket）
 ├── client/
 │   └── client.js        # client 半边（免构建手写 bundle，React 经 DSH 模块系统）
