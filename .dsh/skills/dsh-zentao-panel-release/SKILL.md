@@ -1,14 +1,15 @@
 ---
 name: dsh-zentao-panel-release
-description: 执行 dsh-zentao-panel 仓库的完整发版流程（截图入仓与 README 维护、CHANGELOG 切版、跑离线测试、打 tag 推送、CI 信任发布后用 gh/npm view 核对、按需同步 awesome-dsh-plugin 列表条目），适用于用户要求"发版""切版""发布 npm""更新 awesome 列表条目"，或 release.yml 失败、版本闸门报错时排查。
+description: 执行 @zhoutao0519/dsh-zentao-panel 仓库的完整发版流程（CHANGELOG 切版、跑离线测试、打 tag 推送、CI 信任发布后用 gh/npm view 核对）。适用于用户要求"发版""切版""发布 npm"，或 release.yml 失败、版本闸门报错时排查。首次发布新包需手动 npm publish，之后走 CI。
 disable-model-invocation: true
 ---
 
-# dsh-zentao-panel 发版流程（CI 全自动，2026-10-30 起）
+# @zhoutao0519/dsh-zentao-panel 发版流程（CI 自动，2026-11-26 改名后）
 
 本技能随仓库走（`.dsh/skills/`）：在 DSH 里以本仓库为工作区打开会话时自动载入；
-`disable-model-invocation: true` 表示需要显式调用。**npm 发布不在本机执行**——推 `v*` tag 后由
-`.github/workflows/release.yml` 用信任发布（OIDC）完成。
+`disable-model-invocation: true` 表示需要显式调用。**日常发布不在本机执行**——推 `v*` tag 后由
+`.github/workflows/release.yml` 用信任发布（OIDC）完成；**唯独新包第一次必须手动发布一次**（见下）。
+上游 npm 包 `dsh-zentao-panel` 属于 lhb999，**不能**从本仓库发布，也不要改回去。
 
 ## Steps
 
@@ -19,10 +20,24 @@ disable-model-invocation: true
 3. **跑离线测试**（发布前必须全绿；smoke/host 需真实禅道凭据，默认跳过）：
    ```bash
    node test/client.mjs 2>&1 | tail -3
-   node test/multi.mjs 2>&1 | tail -3
    node test/protocol.mjs 2>&1 | tail -3
+   node test/multi.mjs 2>&1 | tail -3
+   node test/weekly.mjs 2>&1 | tail -3
+   node test/trae-prompt.mjs 2>&1 | tail -3
+   node test/route.mjs 2>&1 | tail -3
    ```
-4. **提交、打 tag、推送**（推送 tag 才触发发布）：
+   ⚠️ 仓库要求 Node ≥ 22；如果本机 `node --version` 是旧版（如 v10），用 DSH 运行时的 Node：
+   `~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node.exe`。
+4. **（仅新包第一次）手动发布一次 + 配 trusted publisher**：npm 信任发布只对**已存在**的包生效。
+   ```bash
+   npm login
+   npm publish --access public
+   npm view @zhoutao0519/dsh-zentao-panel version   # 确认新版本已出现
+   ```
+   然后到 npmjs.com → 该包 → Settings → Trusted publishing，加一条：
+   GitHub owner `Zhoutao0519`、repository `dsh-zentao-panel`、workflow `release.yml`（大小写敏感）。
+   新包 0.7.0 第一次走这一步；之后所有版本都由 CI 发。
+5. **提交、打 tag、推送**（推送 tag 才触发发布）：
    ```bash
    git commit -am "release: vX.Y.Z — <摘要>"
    git tag vX.Y.Z
@@ -30,31 +45,23 @@ disable-model-invocation: true
    git push origin vX.Y.Z          # 或用 git push --tags；--follow-tags 只推送附注标签
    git ls-remote --tags origin | tail -5   # 核对远端已出现该 tag
    ```
-5. **核对 CI 发布结果**（不再本机 `npm publish`）：
+6. **核对 CI 发布结果**：
    ```bash
    gh run list --workflow=release.yml --limit 3
    gh run watch "$(gh run list --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
    gh release view vX.Y.Z --json name,tagName,url
-   npm view dsh-zentao-panel version dist-tags --cache "$PWD/.npm-cache-tmp"
-   ```
-6. **同步 awesome-dsh-plugin 条目**（仅当本版有用户可见变化时；见下节「awesome 条目」）：
-   ```bash
-   gh api -X POST repos/big-li99/awesome-dsh-plugin/merge-upstream -f branch=main --jq .message
-   gh api repos/awesome-dsh-plugin/awesome-dsh-plugin/contents/data/plugins/big-li99__dsh-zentao-panel.yml --jq '.content, .sha'
-   # 改完本地 yml 后（保持单引号转义 ''，含 ": " 必须加引号）：
-   gh api -X POST repos/big-li99/awesome-dsh-plugin/git/refs -f ref=refs/heads/update-zentao-entry -f sha=<fork main sha>
-   gh api -X PUT repos/big-li99/awesome-dsh-plugin/contents/data/plugins/big-li99__dsh-zentao-panel.yml \
-     -f message="Update big-li99/dsh-zentao-panel description for vX.Y.Z" -f branch=update-zentao-entry \
-     -f sha=<上游该文件 blob sha> -f content="$(base64 -i entry.yml)"
-   gh api -X POST repos/awesome-dsh-plugin/awesome-dsh-plugin/pulls \
-     -f title="Update big-li99/dsh-zentao-panel entry (vX.Y.Z)" -f head=big-li99:update-zentao-entry -f base=main -f body="$(cat body.md)"
+   npm view @zhoutao0519/dsh-zentao-panel version dist-tags --cache "$PWD/.npm-cache-tmp"
    ```
 7. **收尾**：
    ```bash
    rm -rf .npm-cache-tmp && git status --short
    ```
+   本仓库不同步 awesome-dsh-plugin 条目——那条收录属于上游 `big-li99/dsh-zentao-panel`，改名后不再对应。
 
-## awesome 条目（`awesome-dsh-plugin` 列表）
+## awesome 条目（`awesome-dsh-plugin` 列表，**仅上游回发版时用**）
+
+> 本仓库是下游发布（`@zhoutao0519/dsh-zentao-panel`），不改这个条目。以下保留给「回到上游
+> `big-li99/dsh-zentao-panel` 发版」的场景。
 
 插件已收录在 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)：
 数据文件 `data/plugins/big-li99__dsh-zentao-panel.yml`（分类 `workflow`）。
@@ -79,31 +86,30 @@ disable-model-invocation: true
   抽不到小节时正文回落到一句 CHANGELOG 链接。
 - `publish` job：校验 tag == `package.json` version（不等直接 fail）→ `npm view` 查该版本是否已在 registry
   （在则跳过）→ `-rc.N` 之类预发布发 `next`，正式版发 `latest`。
-- 鉴权靠 npmjs.com 包设置里的 trusted publisher（owner `big-li99` / repo `dsh-zentao-panel` / 工作流文件名必须是
-  `release.yml`），**配好后 2 天内必须完成首次发布，否则配置过期需删掉重建**。
+- 鉴权靠 npmjs.com 包设置里的 trusted publisher（owner `Zhoutao0519` / repo `dsh-zentao-panel` / 工作流文件名
+  `release.yml`；大小写敏感），**新包第一次必须手动 `npm publish --access public`**，配好 trusted publisher 后
+  **2 天内必须完成首次发布，否则配置过期需删掉重建**。上游包 `dsh-zentao-panel` 属于 lhb999，本仓库发布它会 404。
 
 ## Pitfalls
 
 - **沙箱下 `~/.npm` 不可写**：只影响本机跑 npm 命令（如第 5 步的 `npm view` 核对）——报
   "Log files were not written… ~/.npm/_logs" 时用工作区临时缓存 `--cache "$PWD/.npm-cache-tmp"` 绕开，用完删掉。
   这条**与发布令牌无关**。
-- **不要本机 `npm publish`**：CI 已接管发布，本机发布会绕过版本闸门与 provenance，还可能用错 dist-tag。
-  旧技能里"whoami 401 + publish PUT 404 = 令牌失效"的排查已不适用——真遇到 401/404 先确认是不是有人在本机发，
-  再查 trusted publisher 配置。
+- **本机 `npm publish` 只用于新包第一次**：信任发布只对已存在的包生效，所以 0.7.0 是手动发的；
+  之后一律走 CI，不要再本机发（会绕过版本闸门与 provenance，还可能用错 dist-tag）。
+  真遇到 401/404 先确认是不是又在没配置 trusted publisher 的情况下本机发，再查 npm 包设置。
 - **tag 与版本不一致**：CI 报 `tag vX.Y.Z 与 package.json version … 不一致` → 改 `package.json` 后重打 tag 再推
   （`git tag -f` + 强制推，或删远端 tag 重打），不要靠重跑 workflow 绕。
 - **轻量 tag 不随 `--follow-tags` 推送**：`git tag vX.Y.Z` 建的是轻量标签，`--follow-tags` 只带附注标签；
   要么显式 `git push origin vX.Y.Z`，要么 `git push --tags`。
 - **重跑是安全的**：Release 用 edit 幂等、registry 已有该版本会跳过；修好配置后直接 `gh run rerun` 或重推 tag。
-- **预发布别抢 latest**：`0.5.0-rc.1` 走 `next`，安装要写 `dsh-zentao-panel@next`。
+- **预发布别抢 latest**：`0.8.0-rc.1` 走 `next`，安装要写 `@zhoutao0519/dsh-zentao-panel@next`。
 
 ## Verification
 
 - `node test/client.mjs` / `test/multi.mjs` / `test/protocol.mjs` 输出"全部通过"。
 - `git ls-remote --tags origin` 含新 tag，且指向 `git log --oneline -1` 的 commit。
 - `gh run list --workflow=release.yml` 最近一次 `success`；`gh release view vX.Y.Z` 存在且正文来自 CHANGELOG。
-- `npm view dsh-zentao-panel version` 等于新版本号（正式版时 `dist-tags.latest` 也是它）。
+- `npm view @zhoutao0519/dsh-zentao-panel version` 等于新版本号（正式版时 `dist-tags.latest` 也是它）。
 - 收尾 `git status --short` 干净，`.npm-cache-tmp` 已删除。
-- 有用户可见变化的版本：awesome 列表 PR 的 `compare/main...big-li99:<branch>` 里 `files` 只有
-  `data/plugins/big-li99__dsh-zentao-panel.yml` 一个；`gh pr checks <n>` 的 Submission gate 通过。
-  纯内部修复的版本**不需要**这条。
+- 本仓库**不检查** awesome 列表条目（那是上游 `big-li99/dsh-zentao-panel` 的收录）。

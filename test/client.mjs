@@ -79,7 +79,7 @@ sandbox.globalThis = sandbox;
 vm.runInContext(src, vm.createContext(sandbox));
 
 check('bundle 调用 __ModuleLoader__.load', Boolean(window.__def));
-check('bundle id = dsh-zentao-panel', window.__def && window.__def.id === 'dsh-zentao-panel');
+check('bundle id = @zhoutao0519/dsh-zentao-panel', window.__def && window.__def.id === '@zhoutao0519/dsh-zentao-panel');
 
 const mod = window.__def.factory((name) => (name === 'react' ? React : undefined));
 

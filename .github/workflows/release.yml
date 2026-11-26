@@ -27,11 +27,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --title "dsh-zentao-panel $GITHUB_REF_NAME" --notes-file notes.md
+            gh release edit "$GITHUB_REF_NAME" --title "@zhoutao0519/dsh-zentao-panel $GITHUB_REF_NAME" --notes-file notes.md
           else
-            gh release create "$GITHUB_REF_NAME" --title "dsh-zentao-panel $GITHUB_REF_NAME" --notes-file notes.md
+            gh release create "$GITHUB_REF_NAME" --title "@zhoutao0519/dsh-zentao-panel $GITHUB_REF_NAME" --notes-file notes.md
           fi
 
+  # 发布目标是本仓库自己的包 @zhoutao0519/dsh-zentao-panel。
+  # ⚠️ 新包第一次必须手动 `npm publish --access public`（信任发布只对已存在的包生效），
+  # 之后在 npm 包设置里加 trusted publisher：owner=Zhoutao0519, repo=dsh-zentao-panel, workflow=release.yml。
+  # 不要改回上游包 dsh-zentao-panel——它属于 lhb999，从本仓库发布会 404。
   publish:
     needs: release
     runs-on: ubuntu-latest

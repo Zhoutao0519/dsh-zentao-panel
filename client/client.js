@@ -1,4 +1,4 @@
-// dsh-zentao-panel — client 半边（左侧栏全局面板）
+// @zhoutao0519/dsh-zentao-panel — client 半边（左侧栏全局面板）
 //
 // 入口形态参照 dsh-mnemon：在左侧栏的 sidebar.panellist 列表里注册一个图标行，
 // 同 id 在根作用域 main keyed slot 里注册面板组件——点图标 = ctx.layout.selectPanel(id)，
@@ -12,13 +12,14 @@
 //   并不存在，回落到 #fff 兜底色，正是夜间模式错色的根源。）
 //
 // 装载方式（参照 dsh-notify-me）：dsh.client 声明 → dsh-client-modules 以
-// /plugins/dsh-zentao-panel/client.js 提供 → window.__ModuleLoader__.load 执行。
+// /plugins/@zhoutao0519/dsh-zentao-panel/client.js 提供 → window.__ModuleLoader__.load 执行。
 // 数据通道：ctx.connection.rpc.call('/dsh-ztp9-rpc', endpoint, payload) → host 半边的 loopback RPC。
 (function (root) {
   if (!root || !root.__ModuleLoader__ || typeof root.__ModuleLoader__.load !== 'function') return;
 
   root.__ModuleLoader__.load({
-    id: 'dsh-zentao-panel',
+    // 必须与 package.json 的 name 一致（dsh-client-modules 用 graph row id 匹配 bundle 注册）
+    id: '@zhoutao0519/dsh-zentao-panel',
     factory: (require) => {
       var module = { exports: {} };
       var exports = module.exports;

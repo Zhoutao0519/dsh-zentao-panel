@@ -40,14 +40,20 @@ DSH_HOME=/tmp/zt-host  node test/host.mjs    # apply() + RPC wire 协议端到�
 ```
 凭据走 `ZENTAO_BASE`/`ZENTAO_ACCOUNT`/`ZENTAO_PASSWORD` 或 `~/.dsh/zentao-panel/config.json`——**永远不要把凭据提交到 git**。
 
-发版（2026-10-30 起全自动）：改 `package.json` 的 `version` + 切 `CHANGELOG.md` 顶部小节 →
+发版（2026-11-26 起包名改为 `@zhoutao0519/dsh-zentao-panel`；上游 npm 包 `dsh-zentao-panel` 属于
+lhb999，**不能**从本仓库发布）：改 `package.json` 的 `version` + 切 `CHANGELOG.md` 顶部小节 →
 `git tag vX.Y.Z && git push --tags`。`.github/workflows/release.yml` 的两个 job 依次跑：
 `release`（CHANGELOG 抽段建 GitHub Release，已存在则改而非报错）+ `publish`（**npm 信任发布/OIDC**，
 无需 `NPM_TOKEN`；tag 与 `package.json` 版本不一致直接 fail；版本已在 registry 上则跳过；
-`-rc.N` 之类预发布发 `next`、正式版发 `latest`；public 仓库自动带 provenance）。鉴权靠 npmjs.com
-包设置里的 trusted publisher（owner/repo/**workflow 文件名必须写 `release.yml`**），
-**配好后 2 天内必须完成首次发布，否则配置过期需删掉重建**（[docs](https://docs.npmjs.com/trusted-publishers/)）。
+`-rc.N` 之类预发布发 `next`、正式版发 `latest`；public 仓库自动带 provenance）。
+**新包第一次必须手动 `npm publish --access public`**（信任发布只对已存在的包生效）；之后在 npmjs.com
+包设置里加 trusted publisher：owner `Zhoutao0519`、repo `dsh-zentao-panel`、workflow `release.yml`
+（owner/repo 大小写敏感），**配好后 2 天内必须完成首次发布，否则配置过期需删掉重建**
+（[docs](https://docs.npmjs.com/trusted-publishers/)）。
 workflow 改动验证：`actionlint`（带 shellcheck）零告警；版本闸门可用 `GITHUB_REF_NAME=vX.Y.Z` 本地复跑。
+
+> 2026-11-26：`trae-bridge/` 是本地 Trae 桥接扩展源码（不随 npm 包发布）；改 host/client 代码后
+> 本地验证用 `npm pack` + `plugin_manager install_bundle file:<tgz>` 最快，装完需重启一次宿主清模块缓存。
 
 **awesome-dsh-plugin 列表条目同步**（只有**用户可见**变化的版本才做）：条目是上游仓库
 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 里的

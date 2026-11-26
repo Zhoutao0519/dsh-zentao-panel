@@ -2,6 +2,18 @@
 
 本项目所有显著变更记录于此。版本号遵循 SemVer。
 
+## [0.7.0] - 2026-11-26
+
+### 变更
+
+- **包名改为 `@zhoutao0519/dsh-zentao-panel`**：npm 上的 `dsh-zentao-panel` 属于上游维护者，
+  本仓库改用自有 scope 发布。同步更新了 `package.json` 的 `name` / `repository`、`cordis.patch.yml`
+  的 insert id/name 和 client bundle id；README 的安装名同步改为新包名。
+  **配置目录（`~/.dsh/zentao-panel`）、浏览器 localStorage 键、RPC 通道 `/dsh-ztp9-rpc` 全部不变**，
+  从上游包切换过来不会丢登录态、卡片关联或处理进度。
+- 发布说明：新包第一次需要手动 `npm publish --access public`；之后在 npm 包设置里配置
+  trusted publisher（`Zhoutao0519` / `dsh-zentao-panel` / `release.yml`），打 tag 即可走 CI 自动发布。
+
 ## [0.6.1] - 2026-11-26
 
 ### 修复

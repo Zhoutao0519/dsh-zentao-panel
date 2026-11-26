@@ -6,15 +6,20 @@
 
 [简体中文](README.md) · English
 
-[![npm version](https://img.shields.io/npm/v/dsh-zentao-panel?label=npm&color=cb3837)](https://www.npmjs.com/package/dsh-zentao-panel)
-[![npm downloads](https://img.shields.io/npm/dt/dsh-zentao-panel?label=downloads%20total&color=1F883D)](https://www.npmjs.com/package/dsh-zentao-panel)
-[![GitHub release](https://img.shields.io/github/v/release/big-li99/dsh-zentao-panel)](https://github.com/big-li99/dsh-zentao-panel/releases)
+[![npm version](https://img.shields.io/npm/v/@zhoutao0519/dsh-zentao-panel?label=npm&color=cb3837)](https://www.npmjs.com/package/@zhoutao0519/dsh-zentao-panel)
+[![npm downloads](https://img.shields.io/npm/dt/@zhoutao0519/dsh-zentao-panel?label=downloads%20total&color=1F883D)](https://www.npmjs.com/package/@zhoutao0519/dsh-zentao-panel)
+[![GitHub release](https://img.shields.io/github/v/release/Zhoutao0519/dsh-zentao-panel)](https://github.com/Zhoutao0519/dsh-zentao-panel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![DSH](https://img.shields.io/badge/DSH-0.2.1--rc.2%20%7C%20rc.3-6366f1)](https://github.com/deepseek-ai/deepseek-harness)
 
 </div>
 
 [Install](#install) · [Screenshots](#screenshots) · [Features](#features) · [How to use](#how-to-use) · [Compatibility](#compatibility) · [Known limitations](#known-limitations) · [Data and privacy](#data-and-privacy) · [Development](#development) · [Changelog](CHANGELOG.md)
+
+> **Install name**: this repository publishes as **`@zhoutao0519/dsh-zentao-panel`**. The upstream npm
+> package `dsh-zentao-panel` is maintained by big-li99; the code is the same lineage, and the config
+> directory (`~/.dsh/zentao-panel`), localStorage keys and RPC channel are unchanged — switching over
+> keeps your login, links and progress.
 
 A **ZenTao** icon appears in the DSH sidebar (same mechanism as the Memory System). Click it and the
 ZenTao panel takes over the main area, listing the tasks / bugs / stories **assigned to you**. Pick one
@@ -159,21 +164,21 @@ an edge-floating button with a slide-over panel.
 
 ### From the Plugins page
 
-Sidebar → **Plugins** → **Add plugin** → enter `dsh-zentao-panel` (or a pinned version such as
-`dsh-zentao-panel@0.4.1`) → install → restart DSH.
+Sidebar → **Plugins** → **Add plugin** → enter `@zhoutao0519/dsh-zentao-panel` (or a pinned version such as
+`@zhoutao0519/dsh-zentao-panel@0.7.0`) → install → restart DSH.
 
 ### Command line
 
 ```bash
 # The macOS desktop app ships its own CLI; if `dsh` is on your PATH, use it directly
 DSH="/Applications/DeepSeekRuntime.app/Contents/Resources/runtime/cli/bin/dsh"
-"$DSH" plugin --profile desktop add dsh-zentao-panel
+"$DSH" plugin --profile desktop add @zhoutao0519/dsh-zentao-panel
 ```
 
 From source (development / tracking master):
 
 ```bash
-git clone https://github.com/big-li99/dsh-zentao-panel.git
+git clone https://github.com/Zhoutao0519/dsh-zentao-panel.git
 DSH="/Applications/DeepSeekRuntime.app/Contents/Resources/runtime/cli/bin/dsh"
 "$DSH" plugin --profile desktop add "$(pwd)/dsh-zentao-panel"
 ```
@@ -208,7 +213,7 @@ The login cookie is persisted (`keepLogin`, 30 days), and an expired session tri
 
 ## Compatibility
 
-| DeepSeekRuntime (DSH) | dsh-zentao-panel | Verified on |
+| DeepSeekRuntime (DSH) | Plugin version | Verified on |
 | :--- | :--- | :--- |
 | **0.2.1-rc.3** | `0.4.1` | Desktop (macOS, current local environment) |
 | **0.2.1-rc.2** | `0.4.1`, `0.4.0`, `0.3.0`, `0.2.1`, `0.2.0` | Desktop (macOS) |
@@ -273,7 +278,7 @@ not individually verified, but only standard ZenTao endpoints are used.
 
 ```bash
 DSH="/Applications/DeepSeekRuntime.app/Contents/Resources/runtime/cli/bin/dsh"
-"$DSH" plugin --profile desktop remove dsh-zentao-panel
+"$DSH" plugin --profile desktop remove @zhoutao0519/dsh-zentao-panel
 
 # Optional: delete local credentials (not recoverable)
 rm -rf ~/.dsh/zentao-panel

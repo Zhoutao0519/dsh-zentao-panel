@@ -1,5 +1,6 @@
-# dsh-zentao-panel bundle patch：把插件挂到 profile 加载树。
+# @zhoutao0519/dsh-zentao-panel bundle patch：把插件挂到 profile 加载树。
 # 单包单插件：host 半边（lib/index.js）+ client 半边（dsh.client 声明）都来自本包。
+# ⚠️ entry 的 id / name 必须与 package.json 的 name 完全一致；scoped 名以 @ 开头，YAML 必须加引号。
 - insert:
-    - id: dsh-zentao-panel
-      name: dsh-zentao-panel
+    - id: "@zhoutao0519/dsh-zentao-panel"
+      name: "@zhoutao0519/dsh-zentao-panel"

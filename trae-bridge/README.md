@@ -1,6 +1,6 @@
 # ZenTao Bridge（Trae CN 扩展）
 
-这是给 `dsh-zentao-panel` 用的**本地 Trae 桥接扩展**。
+这是给 `@zhoutao0519/dsh-zentao-panel` 用的**本地 Trae 桥接扩展**。
 
 ## 为什么需要它
 

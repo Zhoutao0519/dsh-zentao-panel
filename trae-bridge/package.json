@@ -3,7 +3,7 @@
   "displayName": "ZenTao Bridge",
   "publisher": "local",
   "version": "0.0.1",
-  "description": "Local bridge: opens a Trae AI chat and sends a prompt from dsh-zentao-panel.",
+  "description": "Local bridge: opens a Trae AI chat and sends a prompt from @zhoutao0519/dsh-zentao-panel.",
   "engines": {
     "vscode": "^1.80.0"
   },

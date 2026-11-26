@@ -6,15 +6,19 @@
 
 简体中文 · [English](README.en.md)
 
-[![npm version](https://img.shields.io/npm/v/dsh-zentao-panel?label=npm&color=cb3837)](https://www.npmjs.com/package/dsh-zentao-panel)
-[![npm downloads](https://img.shields.io/npm/dt/dsh-zentao-panel?label=downloads%20total&color=1F883D)](https://www.npmjs.com/package/dsh-zentao-panel)
-[![GitHub release](https://img.shields.io/github/v/release/big-li99/dsh-zentao-panel)](https://github.com/big-li99/dsh-zentao-panel/releases)
+[![npm version](https://img.shields.io/npm/v/@zhoutao0519/dsh-zentao-panel?label=npm&color=cb3837)](https://www.npmjs.com/package/@zhoutao0519/dsh-zentao-panel)
+[![npm downloads](https://img.shields.io/npm/dt/@zhoutao0519/dsh-zentao-panel?label=downloads%20total&color=1F883D)](https://www.npmjs.com/package/@zhoutao0519/dsh-zentao-panel)
+[![GitHub release](https://img.shields.io/github/v/release/Zhoutao0519/dsh-zentao-panel)](https://github.com/Zhoutao0519/dsh-zentao-panel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![DSH](https://img.shields.io/badge/DSH-0.2.1--rc.2%20%7C%20rc.3-6366f1)](https://github.com/deepseek-ai/deepseek-harness)
 
 </div>
 
 [安装](#安装) · [效果预览](#效果预览) · [功能](#功能) · [使用](#使用) · [兼容性](#兼容性) · [已知限制](#已知限制) · [数据与隐私](#数据与隐私) · [开发](#开发) · [更新日志](CHANGELOG.md)
+
+> **安装名**：本仓库发布为 **`@zhoutao0519/dsh-zentao-panel`**。上游 npm 包 `dsh-zentao-panel`
+> 由 big-li99 维护；两者代码同源，配置目录（`~/.dsh/zentao-panel`）、localStorage 键和 RPC 通道完全一致，
+> 从上游包切换过来不会丢登录态 / 关联 / 进度。
 
 DSH 左侧栏多一个**禅道**图标（与「记忆系统」同款形式）——点开后禅道面板占满主区域，
 列出**指派给你**的任务 / Bug / 需求。挑一条，把它的描述、最近动态和截图变成一份 DSH 对话
@@ -140,21 +144,21 @@ chip 与页脚优先显示别名，原账号 + 实例地址下沉副行。
 
 ### 图形界面（推荐）
 
-侧栏「插件」页 →「添加插件」→ 填入 `dsh-zentao-panel`（或指定版本 `dsh-zentao-panel@0.4.1`）→
-安装 → 重启 DSH。
+侧栏「插件」页 →「添加插件」→ 填入 `@zhoutao0519/dsh-zentao-panel`（或指定版本
+`@zhoutao0519/dsh-zentao-panel@0.7.0`）→ 安装 → 重启 DSH。
 
 ### 命令行
 
 ```bash
 # macOS 桌面版自带 CLI；若 `dsh` 已在 PATH 上，直接用 dsh 即可
 DSH="/Applications/DeepSeekRuntime.app/Contents/Resources/runtime/cli/bin/dsh"
-"$DSH" plugin --profile desktop add dsh-zentao-panel
+"$DSH" plugin --profile desktop add @zhoutao0519/dsh-zentao-panel
 ```
 
 从源码装（开发 / 跟踪 master）：
 
 ```bash
-git clone https://github.com/big-li99/dsh-zentao-panel.git
+git clone https://github.com/Zhoutao0519/dsh-zentao-panel.git
 DSH="/Applications/DeepSeekRuntime.app/Contents/Resources/runtime/cli/bin/dsh"
 "$DSH" plugin --profile desktop add "$(pwd)/dsh-zentao-panel"
 ```
@@ -185,7 +189,7 @@ DSH="/Applications/DeepSeekRuntime.app/Contents/Resources/runtime/cli/bin/dsh"
 
 ## 兼容性
 
-| DeepSeekRuntime (DSH) | dsh-zentao-panel | 验证环境 |
+| DeepSeekRuntime (DSH) | 插件版本 | 验证环境 |
 | :--- | :--- | :--- |
 | **0.2.1-rc.3** | `0.4.1` | 桌面版（macOS，本机现行环境） |
 | **0.2.1-rc.2** | `0.4.1`, `0.4.0`, `0.3.0`, `0.2.1`, `0.2.0` | 桌面版（macOS） |
@@ -238,7 +242,7 @@ DSH="/Applications/DeepSeekRuntime.app/Contents/Resources/runtime/cli/bin/dsh"
 
 ```bash
 DSH="/Applications/DeepSeekRuntime.app/Contents/Resources/runtime/cli/bin/dsh"
-"$DSH" plugin --profile desktop remove dsh-zentao-panel
+"$DSH" plugin --profile desktop remove @zhoutao0519/dsh-zentao-panel
 
 # 可选：清除本机凭据（不可恢复）
 rm -rf ~/.dsh/zentao-panel
