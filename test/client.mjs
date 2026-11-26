@@ -1,0 +1,3206 @@
+// client 半边免渲染测试：验证 bundle 能被 __ModuleLoader__ 加载、apply() 把
+//   左侧栏全局面板（sidebar.panellist 图标行 + main keyed 面板，dsh-mnemon 同款）注册上。
+// 不依赖 DSH / 浏览器：用最小 window/document/React 替身执行真实 bundle。
+// 用法：node test/client.mjs
+import vm from 'node:vm';
+import { readFileSync } from 'node:fs';
+
+const src = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8');
+
+let failures = 0;
+function check(name, cond, extra = '') {
+  console.log(`${cond ? '✅' : '❌'} ${name}${extra ? ` — ${extra}` : ''}`);
+  if (!cond) failures++;
+}
+// fake createElement 不展平 children；CardItem 动作行自 2026-10-27 起分「工具组 + 主操作」
+// 两层（.ztp-acts-right / .ztp-utils），找按钮/下拉统一递归展平。
+function flatNodes(nodes, out = []) {
+  for (const n of nodes || []) {
+    if (!n || typeof n !== 'object') continue;
+    out.push(n);
+    if (Array.isArray(n.children)) flatNodes(n.children, out);
+  }
+  return out;
+}
+// 递归取节点文本（判断 label/说明文案用；fake createElement 下元素是普通对象）
+function textOf(node) {
+  if (node == null) return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  return (node.children || []).map(textOf).join('');
+}
+
+// ── 最小浏览器环境 ────────────────────────────────────────────
+const appended = [];
+const document = {
+  head: { appendChild(el) { appended.push(el); } },
+  createElement() {
+    return { attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, textContent: '' };
+  },
+  querySelector() { return null; },
+  addEventListener() {},
+  removeEventListener() {},
+  getSelection() { return null; },
+};
+const window = { __ModuleLoader__: { load(def) { window.__def = def; } } };
+window.window = window;
+window.document = document;
+window.navigator = { clipboard: { writeText: () => Promise.resolve() } };
+// localStorage 替身（会话关联存储用）
+const lsBacking = new Map();
+window.localStorage = {
+  getItem: (k) => (lsBacking.has(k) ? lsBacking.get(k) : null),
+  setItem: (k, v) => lsBacking.set(k, String(v)),
+  removeItem: (k) => lsBacking.delete(k),
+};
+
+const React = {
+  createElement: (type, props, ...children) => ({ type, props, children }),
+  useState: (v) => [v, () => {}],
+  useEffect: () => {},
+  useMemo: (f) => f(),
+  useCallback: (f) => f,
+};
+
+const sandbox = {
+  window, document, console, setTimeout, clearTimeout, setInterval, clearInterval, Symbol, Object, Array, String, Number, Date, JSON, Math, Promise,
+  Event: class Event {}, HTMLTextAreaElement: class HTMLTextAreaElement {},
+  // 真实图片附件管线用到的 Web API（Node vm 上下文里没有，需要显式提供）
+  atob: (s) => Buffer.from(String(s), 'base64').toString('binary'),
+  File: class File {
+    constructor(parts, name, opts) {
+      this.parts = parts;
+      this.name = name;
+      this.type = (opts && opts.type) || '';
+      this.size = parts.reduce((n, p) => n + (p.byteLength || p.length || 0), 0);
+    }
+  },
+};
+sandbox.globalThis = sandbox;
+vm.runInContext(src, vm.createContext(sandbox));
+
+check('bundle 调用 __ModuleLoader__.load', Boolean(window.__def));
+check('bundle id = dsh-zentao-panel', window.__def && window.__def.id === 'dsh-zentao-panel');
+
+const mod = window.__def.factory((name) => (name === 'react' ? React : undefined));
+
+// ── 假 ctx / 服务 ─────────────────────────────────────────────
+const slotRegs = [];
+const slotInjects = [];
+const fakeSlots = {
+  inject(name, cb) { slotInjects.push(name); return cb(); },
+  register(opts, comp) { slotRegs.push({ opts, comp }); return () => {}; },
+};
+const ctx = {
+  slots: fakeSlots,
+  connection: { rpc: { call: async () => ({ ok: true, value: {} }) } },
+  get(name) { return undefined; },
+};
+
+mod.apply(ctx);
+
+check('apply 通知 CSS 已注入', appended.length === 1 && appended[0].attrs['data-dsh-zentao-panel'] === '1');
+
+// 看板动效样式契约（2026-10-27）：换列光点/滑入/站头闪 + 减弱动效兜底必须都在
+const cssText = appended[0].textContent || '';
+check('CSS：看板换列光点与落位动效已声明',
+  cssText.includes('.ztp-pkt') && cssText.includes('@keyframes ztp-slot-fwd')
+  && cssText.includes('@keyframes ztp-station') && cssText.includes('.ztp-bglyph'));
+check('CSS：prefers-reduced-motion 下关闭看板动效',
+  cssText.includes('@media (prefers-reduced-motion:reduce)')
+  && /prefers-reduced-motion:reduce\)\{[^}]*\.ztp-pkt/.test(cssText));
+// 2026-10-27 用户截图反馈：选中卡 3px 方条从圆角戳出去——必须用 inset 阴影画彩条
+check('CSS：选中卡左彩条用 inset 阴影（跟随圆角，方条不再戳出卡片）',
+  /\.ztp-card\.on\{[^}]*box-shadow:inset 3px 0 0 0/.test(cssText)
+  && /\.ztp-card\.on:before\{opacity:0;\}/.test(cssText));
+// 2026-10-27：「已结束」= 手动终态，灰色封存章 + 卡片灰化（hover/选中恢复可读）
+check('CSS：已结束徽标与卡片灰化已声明',
+  cssText.includes('.ztp-live.ended{') && cssText.includes('.ztp-card.ztp-live-ended{')
+  && cssText.includes('.ztp-card.ztp-live-ended:hover')
+  && cssText.includes('.ztp-panel-card.ztp-live-ended{'));
+
+// ── 左侧栏全局面板（main keyed slot + sidebar.panellist 图标行）──
+const mainReg = slotRegs.find((r) => r.opts.name === 'main');
+const iconReg = slotRegs.find((r) => r.opts.name === 'sidebar.panellist');
+check('slot: main 已声明注入', slotInjects.includes('main'));
+check('slot: sidebar.panellist 已声明注入', slotInjects.includes('sidebar.panellist'));
+check('main 面板已注册，key = zentao（activePanelId 寻址）', mainReg && mainReg.opts.key === 'zentao');
+check('左侧栏图标行已注册，id = zentao（与 main key 同值，sidebar 契约）',
+  iconReg && iconReg.opts.id === 'zentao');
+check('图标 label() = 禅道（展开文字/无障碍名/收起 tooltip）', iconReg && iconReg.opts.label() === '禅道');
+check('图标排列在 dsh-mnemon（order 30 记忆 / 31 技能）之后', iconReg && iconReg.opts.order > 31);
+check('面板/图标组件可实例化', typeof mainReg.comp === 'function' && typeof iconReg.comp === 'function');
+check('左侧栏入口挂上后不挂悬浮兜底（shell.overlay）', !slotInjects.includes('shell.overlay'));
+
+// ── 卡片 → Markdown（精简模板：标题 + 描述/重现步骤，图片走真实附件）──
+const md = mod.cardToMarkdown({
+  kind: 'bug', id: 123, title: '登录页报错', status: 'active', pri: 2, severity: 1,
+  openedBy: '张三', deadline: '2026-10-30', url: 'http://z/bug-view-123.html', descBrief: '步骤…',
+});
+check('cardToMarkdown 含标题行', md.includes('## 禅道Bug #123：登录页报错'));
+check('cardToMarkdown 用「重现步骤/描述」小节', md.includes('### 重现步骤/描述'));
+check('cardToMarkdown 不含元信息（类型/状态/优先级/截止）',
+  !md.includes('**类型**') && !md.includes('**状态**') && !md.includes('**优先级**') && !md.includes('**截止**'));
+check('cardToMarkdown 不含原地址', !md.includes('bug-view-123.html'));
+check('cardToMarkdown 不含插件页脚', !md.includes('来自 dsh-zentao-panel'));
+check('cardToMarkdown 去掉 [图片：xxx] 文本占位符',
+  !mod.cardToMarkdown({ kind: 'bug', id: 1, title: 't' }, { desc: '取消该限制。\n[图片：35861.png]' }).includes('[图片'));
+check('cardToMarkdown 描述为空时只有标题行',
+  mod.cardToMarkdown({ kind: 'bug', id: 1, title: 't' }, null) === '## 禅道Bug #1：t');
+
+// ── 插入对话带「最近动态」（2026-10-27 用户要求；只加在插入模板，「处理」保持原样）──
+const actsSample = [
+  { actor: '张三', date: '2026-09-20 10:00:00', desc: '由 张三 创建。', comment: '', images: [], history: [] },
+  {
+    actor: '李四', date: '2026-09-21 11:30:00', desc: '由 李四 指派给 我。',
+    comment: '看下这个 [图片：35861.png]', images: [{ url: 'http://z/file-read-35861.png', name: '35861.png' }],
+    history: [{ field: '状态', old: '激活', new: '已解决' }],
+  },
+];
+const insCard = { kind: 'bug', id: 123, title: '登录页报错', descBrief: '列表摘要…' };
+const insDetail = { desc: '完整描述正文', images: [{ url: 'http://z/file-read-1.png', name: '1.png' }], actions: actsSample };
+const plainMd = mod.cardToMarkdown(insCard, insDetail);
+check('cardToMarkdown 默认模板不含最近动态（处理/复制/批量行为不变）',
+  !plainMd.includes('最近动态') && plainMd.includes('完整描述正文'));
+const insMd = mod.cardToMarkdown(insCard, insDetail, { actions: true });
+check('插入 Markdown 追加「最近动态（N 条）」小节', insMd.includes('### 最近动态（2 条）'));
+check('插入 Markdown 动态行带日期 + host 现成中文句',
+  insMd.includes('- 2026-09-21 11:30 由 李四 指派给 我。'));
+check('插入 Markdown 备注压成子项并去掉图片占位符',
+  insMd.includes('  - 备注：看下这个') && !insMd.includes('[图片'));
+check('插入 Markdown 字段变更写成「字段：旧 → 新」', insMd.includes('  - 状态：激活 → 已解决'));
+check('插入 Markdown 无 actions 时不加小节',
+  !mod.cardToMarkdown(insCard, { desc: 'd', actions: [] }, { actions: true }).includes('最近动态'));
+const manyActs = Array.from({ length: 40 }, (_, i) => ({ date: '2026-09-01 08:00:00', desc: '第 ' + (i + 1) + ' 条' }));
+const manyMd = mod._test.actionsToMarkdown(manyActs);
+check('动态超过上限只带最近 30 条并报总数',
+  manyMd.includes('### 最近动态（最近 30 条，共 40 条）')
+  && manyMd.split('\n').filter((l) => l.startsWith('- 2026')).length === 30
+  && manyMd.includes('第 40 条') && !manyMd.includes('第 10 条\n'));
+check('动态全空条目 → 空串（不产生空小节）',
+  mod._test.actionsToMarkdown([{ desc: '', comment: '', history: [] }, null]) === ''
+  && mod._test.actionsToMarkdown(null) === '');
+
+const insImgs = mod._test.insertImagesOf(insCard, insDetail);
+check('插入图片 = 描述图 + 动态备注图（按 url 去重）',
+  insImgs.length === 2
+  && insImgs.some((x) => x.url.includes('file-read-1.png'))
+  && insImgs.some((x) => x.url.includes('file-read-35861.png')));
+check('插入图片上限 20 张（DSH 单消息上限）',
+  mod._test.insertImagesOf({ kind: 'bug', id: 1 }, {
+    images: Array.from({ length: 25 }, (_, i) => ({ url: 'http://z/file-read-' + (i + 1) + '.png', name: i + '.png' })),
+  }).length === 20);
+const longActs = Array.from({ length: 31 }, (_, i) => ({
+  date: '2026-09-01 08:00:00', desc: '第 ' + (i + 1) + ' 条',
+  images: i === 0 ? [{ url: 'http://z/file-read-old.png', name: 'old.png' }]
+    : (i === 30 ? [{ url: 'http://z/file-read-new.png', name: 'new.png' }] : []),
+}));
+const longImgs = mod._test.insertImagesOf({ kind: 'bug', id: 1 }, { images: [], actions: longActs });
+check('被截掉的老动态备注图不附图（只取写进 Markdown 的条目）',
+  longImgs.length === 1 && longImgs[0].url.includes('file-read-new.png'));
+
+const prepCalls = [];
+const prepDetail = await mod._test.prepareInsertPayload(insCard, null, (ep, payload) => {
+  prepCalls.push({ ep, payload });
+  return Promise.resolve({ ok: true, value: insDetail });
+});
+check('插入准备：列表卡（无详情）先拉 zentao.detail 再拼内容',
+  prepCalls.length === 1 && prepCalls[0].ep === 'zentao.detail'
+  && prepCalls[0].payload.kind === 'bug' && prepCalls[0].payload.id === 123);
+check('插入准备：拉到详情后带完整描述 + 最近动态 + 备注图',
+  prepDetail.fetched === true && prepDetail.md.includes('完整描述正文')
+  && prepDetail.md.includes('### 最近动态（2 条）')
+  && prepDetail.images.some((x) => x.url.includes('file-read-35861.png')));
+let noCall = 0;
+const prepLocal = await mod._test.prepareInsertPayload(insCard, insDetail, () => { noCall++; return Promise.resolve({ ok: false }); });
+check('插入准备：详情已在手边（含 actions）→ 不再发 RPC',
+  noCall === 0 && prepLocal.md.includes('### 最近动态（2 条）') && !prepLocal.error);
+const prepFail = await mod._test.prepareInsertPayload(insCard, null, () => Promise.resolve({ ok: false, error: { message: '不存在' } }));
+check('插入准备：详情读取失败 → 退列表摘要、标 error（插入照常）',
+  prepFail.error === '不存在' && !prepFail.md.includes('最近动态')
+  && prepFail.md.includes('列表摘要…') && prepFail.images.length === 0 && prepFail.fetched === undefined);
+const prepThrow = await mod._test.prepareInsertPayload(insCard, null, () => Promise.reject(new Error('network down')));
+check('插入准备：RPC 抛错同样退摘要不 reject', prepThrow.error === 'network down' && prepThrow.md.includes('列表摘要…'));
+
+// ── 真实图片附件管线（conversation.createDrafts + facade.addAttachments）──
+const base64Png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]).toString('base64');
+const images = mod._test.imagesOf(
+  { kind: 'bug', id: 1 },
+  { images: [{ url: 'http://z/file-read-1.png', name: '1.png' }, { url: 'http://z/file-read-2.png', name: '2.png' }] },
+);
+check('imagesOf 读取详情 images', images.length === 2 && images[0].url.includes('file-read-1.png'));
+check('imagesOf 无图时返回空数组', mod._test.imagesOf({ kind: 'bug', id: 1 }, {}).length === 0);
+check('bytesFromBase64 还原字节', Array.from(mod._test.bytesFromBase64(base64Png)).slice(0, 4).join(',') === '137,80,78,71');
+
+const draftsCreated = [];
+const addedIds = [];
+const fakeFacade = {
+  draft: '',
+  setDraft(t) { this.draft = t; },
+  focus() {}, submit() {},
+  addAttachments(ids) { addedIds.push(...ids); return true; },
+};
+const fakeConversation = {
+  input: { for: () => fakeFacade },
+  createDrafts(sessionId, files) {
+    draftsCreated.push({ sessionId, files });
+    return files.map((f, i) => ({ id: 'draft-' + (i + 1), kind: 'image', name: f.name }));
+  },
+};
+ctx.connection.rpc.call = async (channel, endpoint) => (endpoint === 'zentao.image'
+  ? { ok: true, value: { name: '1.png', mediaType: 'image/png', base64: base64Png, bytes: 10 } }
+  : { ok: false, error: { message: 'unexpected endpoint ' + endpoint } });
+
+const att = await mod._test.attachImagesToDraft(images, { sessionId: 's1', facade: fakeFacade, conversation: fakeConversation });
+check('attachImagesToDraft 走 createDrafts + addAttachments',
+  att.ok === true && att.count === 2 && draftsCreated.length === 1 && draftsCreated[0].sessionId === 's1' && addedIds.length === 2);
+check('图片以 File(image/png) 交给 DSH', draftsCreated[0].files.every((f) => f.type === 'image/png' && f.size === 10));
+
+const attOld = await mod._test.attachImagesToDraft(images, { sessionId: 's1', facade: {}, conversation: {} });
+check('旧版 DSH 无 createDrafts 时降级不报错', attOld.ok === false && attOld.reason === 'unsupported');
+
+// insertToCurrentChat：服务级 setDraft + 图片附件（经 ctx.get 懒查找 sessions/conversation）
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { s1: { cwd: '/tmp' } } }) },
+    scope: () => ({}),
+  };
+  if (name === 'conversation') return fakeConversation;
+  return undefined;
+};
+const ins = await mod._test.insertToCurrentChat('## 卡片', images);
+check('insertToCurrentChat 服务级插入 + 图片附件',
+  ins.mode === 'service' && ins.attached === 2 && fakeFacade.draft === '## 卡片');
+
+// ── 「处理」弹层：工作区/模型上下文收集（懒查找，缺服务不抛错）──
+// 先回到「无 sessions/workspaces/remote」的环境验证兜底
+ctx.get = function (name) { return undefined; };
+const bare = await mod._test.collectDispatchContext();
+check('collectDispatchContext 服务缺失时返回空结构且不抛错',
+  bare.workspaces.length === 0 && bare.modelGroups.length === 0
+  && bare.currentWorkspaceId === null && bare.currentModel === null && bare.cwd === null);
+
+const fakeCatalog = {
+  ok: true,
+  value: {
+    default: { provider: 'official', model: 'deepseek-chat', reasoningEffort: 'high' },
+    groups: [
+      { id: 'official', name: '官方', models: [
+        { id: 'deepseek-chat', name: 'DeepSeek Chat', reasoning: { efforts: [{ id: 'low', name: '低' }, { id: 'high', name: '高' }], defaultEffort: 'high' } },
+        { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+      ] },
+      { id: 'custom', name: '自定义接入', models: [
+        { id: 'glm-4.6', name: 'GLM 4.6', reasoning: { efforts: [{ id: 'mid', name: '中' }] } },
+      ] },
+    ],
+  },
+};
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { s1: { cwd: '/tmp/proj' } } }) },
+    scope: () => ({}),
+  };
+  if (name === 'conversation') return fakeConversation;
+  if (name === 'workspaces') return {
+    list: { getSnapshot: () => ({ items: [
+      { workspaceId: 'w1', title: '业财中台', path: '/Users/x/yewu', sessionIds: ['s1'] },
+      { workspaceId: 'w2', title: '电子档案', path: '/Users/x/archive', sessionIds: [] },
+    ] }) },
+  };
+  if (name === 'modelDirectories') return {
+    directoryFor: () => ({ load: async () => ({ current: { provider: 'custom', model: 'glm-4.6', reasoningEffort: 'mid' } }) }),
+  };
+  // 真机形态：ctx.get('remote') 是 ClientRemoteService 裸实例（没有 .session 属性）；
+  // 命名空间方法是独立 cordis 服务 remote.session（官方 ModelDirectoryResolver inject 的同一名字）
+  if (name === 'remote') return { namespaces: new Map() };
+  if (name === 'remote.session') return {
+    modelCatalog: async () => fakeCatalog, selectModel: async () => ({ ok: true, value: { selected: {} } }),
+  };
+  return undefined;
+};
+const dc = await mod._test.collectDispatchContext();
+check('collectDispatchContext 收集工作区列表', dc.workspaces.length === 2 && dc.workspaces[0].title === '业财中台');
+check('collectDispatchContext 识别当前会话归属的工作区', dc.currentWorkspaceId === 'w1');
+check('collectDispatchContext 读当前会话目录', dc.cwd === '/tmp/proj');
+check('collectDispatchContext 解析模型目录（provider 分组 + efforts/defaultEffort）',
+  dc.modelGroups.length === 2 && dc.modelGroups[0].name === '官方'
+  && dc.modelGroups[0].models[0].efforts.length === 2 && dc.modelGroups[0].models[0].defaultEffort === 'high'
+  && dc.modelGroups[1].models[0].id === 'glm-4.6'
+  && dc.modelGroups[0].models[1].efforts.length === 0);
+check('collectDispatchContext 读全局默认与当前会话在用模型',
+  dc.modelDefault && dc.modelDefault.model === 'deepseek-chat'
+  && dc.currentModel && dc.currentModel.provider === 'custom' && dc.currentModel.reasoningEffort === 'mid');
+check('mock 复现真机形态：ctx.get("remote") 裸实例上没有 .session 属性（2026-10-24 真机 bug 的前提）',
+  ctx.get('remote').session === undefined);
+
+// ── 「处理」下发：create 传所选工作区；selectModel 按会话设置所选模型/思考强度 ──
+// 2026-10-24 用户要求「处理后不自动跳转新会话」：dispatch 只 retain（后台保活供
+// facade 填草稿/发送），绝不调 uiWorkspace.openSession（跳转来源，open 被调用即违规）
+let created = null, opened = null, retained = null, selectedModel = null;
+let selectModelResult = { ok: true, value: { selected: {} } };
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { s1: { cwd: '/tmp/proj' } } }) },
+    scope: () => ({}),
+    create(opts) { created = opts; return 's-new'; },
+    retain(id, opts) { retained = { id, opts }; return { sessionId: id, release() {} }; },
+  };
+  if (name === 'conversation') return fakeConversation;
+  if (name === 'uiWorkspace') return { openSession(id) { opened = id; } };
+  if (name === 'remote') return { namespaces: new Map() };
+  if (name === 'remote.session') return {
+    modelCatalog: async () => fakeCatalog,
+    selectModel: async (req) => { selectedModel = req; return selectModelResult; },
+  };
+  return undefined;
+};
+let dr = await mod._test.dispatchToNewSession('## 卡片', [], {
+  workspaceId: 'w2',
+  model: { provider: 'custom', model: 'glm-4.6', reasoningEffort: 'mid' },
+});
+check('dispatchToNewSession 传所选工作区（不掺 cwd）',
+  created && created.workspaceId === 'w2' && !('cwd' in created));
+check('dispatchToNewSession 按新会话 selectModel（provider/model/思考强度）',
+  selectedModel && selectedModel.sessionId === 's-new' && selectedModel.provider === 'custom'
+  && selectedModel.model === 'glm-4.6' && selectedModel.reasoningEffort === 'mid');
+check('dispatchToNewSession 不跳转：只 retain（zentao-panel 来源）不调 uiWorkspace.openSession',
+  retained && retained.id === 's-new' && retained.opts.source === 'zentao-panel' && opened === null);
+check('dispatchToNewSession 模型设置成功后自动发送',
+  opened === null && dr.ok && dr.mode === 'dispatched' && dr.sessionId === 's-new' && fakeFacade.draft === '## 卡片');
+
+selectModelResult = { ok: false, error: { code: 'session/model-unavailable', message: 'model not routable' } };
+selectedModel = null;
+dr = await mod._test.dispatchToNewSession('## 卡片', [], { model: { provider: 'custom', model: 'glm-4.6' } });
+check('dispatchToNewSession 模型被拒时填草稿但不自动发送',
+  selectedModel && !('reasoningEffort' in selectedModel)
+  && dr.ok && dr.mode === 'draft' && dr.message.includes('模型设置失败') && fakeFacade.draft === '## 卡片');
+
+// conversation 服务缺失（facade 拿不到）→ 不自动发，返回 ok:false 让上层降级插入当前会话，
+// 且必须释放后台 retain（新会话是空的，不能留悬挂连接）
+let released = 0;
+const savedGet = ctx.get;
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { s1: { cwd: '/tmp/proj' } } }) },
+    create() { return 's-empty'; },
+    retain(id) { return { sessionId: id, release() { released++; } }; },
+    scope: () => ({}),
+  };
+  return undefined; // conversation / remote.session 都没有
+};
+dr = await mod._test.dispatchToNewSession('## 卡片', [], {});
+check('conversation 服务缺失 → 不自动发、返回 unavailable 供上层降级当前会话',
+  dr && dr.ok === false && dr.mode === 'unavailable' && dr.sessionId === 's-empty');
+check('降级路径立即释放后台 retain（不留悬挂连接）', released === 1);
+ctx.get = savedGet;
+
+dr = await mod._test.dispatchToNewSession('## 卡片', [], { cwd: '/other/dir' });
+check('dispatchToNewSession 选「继承目录」时只传 cwd',
+  created && created.cwd === '/other/dir' && !('workspaceId' in created));
+
+created = null; selectedModel = null;
+dr = await mod._test.dispatchToNewSession('## 卡片', []);
+check('dispatchToNewSession 未选择时保持旧行为（继承当前 cwd、不动模型）',
+  created && created.cwd === '/tmp/proj' && selectedModel === null && dr.mode === 'dispatched');
+
+// ── 「插入对话」（2026-10-25 改版）：与「处理」同款弹层，但新建会话后自动跳转、只填草稿不发送 ──
+let insSubmitted = 0, insReleased = 0, insOpened = null, insCreated = null, insSelected = null;
+const insLog = [];
+const insFacade = {
+  draft: '',
+  setDraft(t) { insLog.push('setDraft'); this.draft = t; },
+  focus() {}, submit() { insSubmitted++; insLog.push('submit'); },
+  addAttachments() { insLog.push('attach'); return true; },
+};
+const insConversation = {
+  input: { for: () => insFacade },
+  createDrafts(sid, files) { insLog.push('drafts'); return files.map((f, i) => ({ id: 'd' + (i + 1), kind: 'image' })); },
+};
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { s1: { cwd: '/tmp/proj' } } }) },
+    scope: () => ({}),
+    create(opts) { insCreated = opts; return 's-ins'; },
+    retain(id, opts) { return { sessionId: id, opts, release() { insReleased++; } }; },
+  };
+  if (name === 'conversation') return insConversation;
+  if (name === 'uiWorkspace') return { openSession(id) { insOpened = id; insLog.push('open'); } };
+  if (name === 'remote.session') return {
+    selectModel: async (req) => { insSelected = req; return { ok: true, value: { selected: {} } }; },
+  };
+  return undefined;
+};
+const ir = await mod._test.insertToNewSession('## 卡片', images, {
+  workspaceId: 'w2', model: { provider: 'custom', model: 'glm-4.6', reasoningEffort: 'mid' },
+});
+check('insertToNewSession 传所选工作区新建会话',
+  insCreated && insCreated.workspaceId === 'w2' && !('cwd' in insCreated) && ir.ok && ir.sessionId === 's-ins');
+check('insertToNewSession 自动跳转新会话（uiWorkspace.openSession）', ir.mode === 'jumped' && insOpened === 's-ins');
+check('跳转前文本草稿已写入（setDraft 先于 open，跳过去不空白）',
+  insLog.indexOf('setDraft') !== -1 && insLog.indexOf('setDraft') < insLog.indexOf('open'));
+check('insertToNewSession 不自动发送（不 submit）', insSubmitted === 0);
+check('跳转成功后释放后台 retain（mainView 接管保活）', insReleased === 1);
+check('selectModel 照常按新会话设置（后台进行）',
+  insSelected && insSelected.sessionId === 's-ins' && insSelected.provider === 'custom'
+  && insSelected.model === 'glm-4.6' && insSelected.reasoningEffort === 'mid');
+await new Promise((r) => setTimeout(r, 10));
+check('图片附件照常注册（跳转不拦附件）', insLog.indexOf('drafts') !== -1 && insLog.indexOf('attach') !== -1);
+check('新会话草稿文本就位', insFacade.draft === '## 卡片');
+
+// uiWorkspace 缺失 → 跳不了：保留 retain（草稿还在后台会话里），draft 模式提示从会话列表打开
+insReleased = 0; insOpened = null;
+const insGetWithWs = ctx.get;
+ctx.get = function (name) { return name === 'uiWorkspace' ? undefined : insGetWithWs(name); };
+const ir2 = await mod._test.insertToNewSession('## 乙', [], {});
+check('uiWorkspace 缺失 → 不跳转、不释放 retain（draft 模式，草稿保留）',
+  ir2.ok && ir2.mode === 'draft' && ir2.sessionId === 's-ins' && insOpened === null
+  && insReleased === 0 && ir2.message.includes('会话列表') && insFacade.draft === '## 乙');
+ctx.get = insGetWithWs;
+
+// conversation 缺失 → ok:false + 释放 retain（上层降级插入当前会话输入框）
+let ins3Released = 0;
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { s1: { cwd: '/tmp' } } }) },
+    create() { return 's-ins3'; },
+    retain(id) { return { sessionId: id, release() { ins3Released++; } }; },
+    scope: () => ({}),
+  };
+  if (name === 'uiWorkspace') return { openSession() {} };
+  return undefined; // conversation / remote.session 都没有
+};
+const ir3 = await mod._test.insertToNewSession('## 丙', [], {});
+check('conversation 服务缺失 → 返回 unavailable 供上层降级当前会话，并释放 retain',
+  ir3.ok === false && ir3.mode === 'unavailable' && ir3.sessionId === 's-ins3' && ins3Released === 1);
+
+// ── 「新建对话」的空白会话（2026-10-27）：弹层取消「自动带入」→ 只建会话 + 设模型 + 跳转 ──
+let nbCreated = null, nbOpened = null, nbSelected = null;
+const nbGet = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { s1: { cwd: '/tmp/proj' } } }) },
+    create(opts) { nbCreated = opts; return 's-blank'; },
+  };
+  if (name === 'remote.session') return {
+    selectModel: async (req) => { nbSelected = req; return { ok: true, value: { selected: {} } }; },
+  };
+  if (name === 'uiWorkspace') return { openSession(id) { nbOpened = id; } };
+  return undefined;
+};
+ctx.get = nbGet;
+let nbr = await mod._test.newBlankSession({ workspaceId: 'w9', model: { provider: 'custom', model: 'glm-4.6' } });
+check('newBlankSession：按所选工作区建会话 + 设置模型 + 跳转（不依赖 conversation 服务）',
+  nbCreated && nbCreated.workspaceId === 'w9' && !('cwd' in nbCreated)
+  && nbSelected && nbSelected.sessionId === 's-blank' && nbSelected.provider === 'custom'
+  && nbSelected.model === 'glm-4.6' && nbOpened === 's-blank'
+  && nbr.ok && nbr.mode === 'jumped' && nbr.sessionId === 's-blank'
+  && nbr.message.includes('空白会话'));
+nbOpened = null; nbCreated = null;
+ctx.get = function (name) { return name === 'uiWorkspace' ? undefined : nbGet(name); };
+nbr = await mod._test.newBlankSession({ cwd: '/other/dir' });
+check('newBlankSession：uiWorkspace 缺失 → 会话已建但不跳转（mode created，可从会话列表打开）',
+  nbr.ok && nbr.mode === 'created' && nbr.sessionId === 's-blank'
+  && nbOpened === null && nbCreated && nbCreated.cwd === '/other/dir' && nbr.message.includes('会话列表'));
+ctx.get = function (name) { return name === 'sessions' ? undefined : nbGet(name); };
+nbr = await mod._test.newBlankSession({});
+check('newBlankSession：sessions 缺失 → ok:false（交上层提示，不静默）',
+  nbr.ok === false && nbr.mode === 'unavailable' && nbr.message.includes('sessions'));
+ctx.get = nbGet;
+
+// 「自动带入」偏好：默认勾选；取消后记住；可恢复
+window.localStorage.removeItem('dsh-zentao-panel.carry.v1');
+check('「自动带入」偏好：默认勾选', mod._test.readCarryPref() === true);
+mod._test.saveCarryPref(false);
+check('「自动带入」偏好：取消后落盘并读回 false',
+  mod._test.readCarryPref() === false
+  && window.localStorage.getItem('dsh-zentao-panel.carry.v1') === '0');
+mod._test.saveCarryPref(true);
+check('「自动带入」偏好：恢复勾选', mod._test.readCarryPref() === true);
+window.localStorage.removeItem('dsh-zentao-panel.carry.v1');
+
+// ── 计划模式（2026-11-11 用户要求）：「新建对话」/「处理」弹层勾选 → 新会话先 /plan ──
+// DSH 没有 plan 的 remote 方法，官方 PlanChip 走命令通道：remote.commands.execute(id, '/plan', [])
+window.localStorage.removeItem('dsh-zentao-panel.plan.v1');
+check('「计划模式」偏好：默认关闭', mod._test.readPlanPref() === false);
+mod._test.savePlanPref(true);
+check('「计划模式」偏好：勾选后落盘并读回 true',
+  mod._test.readPlanPref() === true && window.localStorage.getItem('dsh-zentao-panel.plan.v1') === '1');
+mod._test.savePlanPref(false);
+check('「计划模式」偏好：取消后读回 false', mod._test.readPlanPref() === false);
+window.localStorage.removeItem('dsh-zentao-panel.plan.v1');
+
+// 服务缺失 → soft（同 selectModelFor 口径：不拦截下发）
+ctx.get = function () { return undefined; };
+let pmRes = await mod._test.applyPlanMode('s-x');
+check('applyPlanMode：remote.commands 缺失 → soft（不拦截下发）', pmRes.ok === true && pmRes.soft === true);
+
+let pmCall = null;
+let pmValue = { ok: true, value: { commandId: 'cmd-1', result: { kind: 'success' } } };
+ctx.get = function (name) {
+  if (name === 'remote.commands') {
+    return { execute(sid, line, atts) { pmCall = { sid, line, atts }; return pmValue; } };
+  }
+  return undefined;
+};
+pmRes = await mod._test.applyPlanMode('s-new');
+check('applyPlanMode：走 remote.commands.execute(sessionId, "/plan", [])（不带附件）',
+  pmRes.ok === true && pmCall && pmCall.sid === 's-new' && pmCall.line === '/plan'
+  && Array.isArray(pmCall.atts) && pmCall.atts.length === 0);
+
+pmValue = { ok: false, error: { code: 'session/not-running', message: 'no agent' } };
+pmRes = await mod._test.applyPlanMode('s-new');
+check('applyPlanMode：命令显式失败 → ok:false + 错误码（调用方据此不代发）',
+  pmRes.ok === false && pmRes.message === 'session/not-running');
+
+pmValue = { ok: true, value: undefined }; // 宿主没有这个命令（未组合 dsh-plan-mode）
+pmRes = await mod._test.applyPlanMode('s-new');
+check('applyPlanMode：命令不存在（value 缺席）→ ok:false + unknown（旧版 DSH）',
+  pmRes.ok === false && pmRes.reason === 'unknown');
+
+pmValue = { ok: true, value: { commandId: 'c', result: { kind: 'error', text: '/plan 不接受附件' } } };
+pmRes = await mod._test.applyPlanMode('s-new');
+check('applyPlanMode：handler 回 kind:error → ok:false（带宿主原文）',
+  pmRes.ok === false && pmRes.reason === 'rejected' && pmRes.message.includes('不接受附件'));
+
+// 三条链路接入：dispatch（先 /plan 再代发，开不起来就只填草稿）
+pmValue = { ok: true, value: { commandId: 'c', result: { kind: 'success' } } };
+let pSubmitted = 0, pPlanCall = null;
+const pFacade = {
+  draft: '',
+  setDraft(t) { this.draft = t; }, focus() {}, submit() { pSubmitted++; },
+  addAttachments() { return true; },
+};
+const pConversation = {
+  input: { for: () => pFacade },
+  createDrafts: (sid, files) => files.map((f, i) => ({ id: 'pd' + i, kind: 'image' })),
+};
+const planGet = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { s1: { cwd: '/tmp/proj' } } }) },
+    scope: () => ({}), create() { return 's-plan'; },
+    retain(id) { return { sessionId: id, release() {} }; },
+  };
+  if (name === 'conversation') return pConversation;
+  if (name === 'remote.session') return { selectModel: async () => ({ ok: true, value: {} }) };
+  if (name === 'remote.commands') {
+    return { execute(sid, line) { pPlanCall = { sid, line }; return pmValue; } };
+  }
+  return undefined;
+};
+ctx.get = planGet;
+let pr = await mod._test.dispatchToNewSession('## 卡片', [], { planMode: true });
+check('dispatchToNewSession：勾选计划模式 → 建会话后执行 /plan（不产生模型输入）',
+  pPlanCall && pPlanCall.sid === 's-plan' && pPlanCall.line === '/plan');
+check('dispatchToNewSession：计划模式已开启时照常自动发送（结果文案标注）',
+  pr.ok && pr.mode === 'dispatched' && pr.message.includes('计划模式已开启'));
+
+pmValue = { ok: false, error: { code: 'plan/failed', message: 'boom' } };
+pPlanCall = null;
+pr = await mod._test.dispatchToNewSession('## 卡片', [], { planMode: true });
+check('dispatchToNewSession：计划模式开不起来 → 只填草稿不代发（不替用户决定「直接开工」）',
+  pPlanCall !== null && pr.ok && pr.mode === 'draft'
+  && pr.message.includes('计划模式未能开启') && pSubmitted === 0);
+
+pmValue = { ok: true, value: { commandId: 'c', result: { kind: 'success' } } };
+pPlanCall = null;
+pr = await mod._test.dispatchToNewSession('## 卡片', [], {});
+check('dispatchToNewSession：未勾选计划模式 → 完全不碰 remote.commands',
+  pPlanCall === null && pr.ok && pr.mode === 'dispatched');
+
+// insert / newBlank：跳转前先开计划模式（落地时「计划」chip 已在）
+let iOpened = null, iPlanLine = null;
+ctx.get = function (name) {
+  const base = planGet(name);
+  if (name === 'uiWorkspace') return { openSession(id) { iOpened = id; } };
+  if (name === 'remote.commands') {
+    return { execute(sid, line) { iPlanLine = line; return { ok: true, value: { commandId: 'c', result: { kind: 'success' } } }; } };
+  }
+  return base;
+};
+const irp = await mod._test.insertToNewSession('## 卡片', [], { planMode: true });
+check('insertToNewSession：跳转前已开计划模式（落地即「计划」chip）',
+  irp.ok && irp.mode === 'jumped' && iOpened === 's-plan' && iPlanLine === '/plan');
+
+iPlanLine = null;
+const nbp = await mod._test.newBlankSession({ planMode: true });
+check('newBlankSession：空白会话同样支持计划模式（建会话后 /plan 再跳转）',
+  nbp.ok && nbp.mode === 'jumped' && iPlanLine === '/plan');
+
+ctx.get = nbGet;
+
+// ── 会话关联：「处理」成功后卡片上显示关联会话，可一键跳转 ──
+const card123 = { kind: 'bug', id: 123, title: '登录页报错' };
+check('sessionLinkKey 带账号前缀 + kind-id（不同禅道账号互不混卡）',
+  mod._test.sessionLinkKey('acct1', card123) === 'acct1/bug-123');
+check('sessionLinkKey 无账号时用 anon 前缀', mod._test.sessionLinkKey(null, card123) === 'anon/bug-123');
+
+let link = mod._test.saveSessionLink('acct1', card123, 's-new');
+check('saveSessionLink 记录 sessionId 与处理时间', link.sessionId === 's-new' && typeof link.at === 'number');
+check('getSessionLink 读回关联', mod._test.getSessionLink('acct1', card123).sessionId === 's-new');
+mod._test.saveSessionLink('acct1', card123, 's-newer');
+check('同卡片再次处理 → 覆盖为最新会话', mod._test.getSessionLink('acct1', card123).sessionId === 's-newer');
+check('其它账号的卡片不受影响', mod._test.getSessionLink('acct2', card123) === null);
+mod._test.saveSessionLink('acct2', card123, 's-acct2');
+check('两个账号各自保留关联',
+  mod._test.getSessionLink('acct1', card123).sessionId === 's-newer'
+  && mod._test.getSessionLink('acct2', card123).sessionId === 's-acct2');
+mod._test.removeSessionLink('acct2', card123);
+check('removeSessionLink 只清对应账号',
+  mod._test.getSessionLink('acct2', card123) === null && mod._test.getSessionLink('acct1', card123) !== null);
+
+lsBacking.set('dsh-zentao-panel.links.v1', '{oops');
+check('存储损坏时读作空表不抛错', typeof mod._test.readLinkMap() === 'object');
+check('坏数据下关联读为空（自愈）', mod._test.getSessionLink('acct1', card123) === null);
+lsBacking.delete('dsh-zentao-panel.links.v1');
+
+check('fmtLinkAt 输出「M月d日 HH:mm」', /^\d+月\d+日 \d{2}:\d{2}$/.test(mod._test.fmtLinkAt(Date.now())));
+check('fmtLinkAt 无效时间为空串', mod._test.fmtLinkAt(NaN) === '' && mod._test.fmtLinkAt(undefined) === '');
+
+check('sessionLinkView 无关联 → null', mod._test.sessionLinkView(null, {}) === null);
+const vLive = mod._test.sessionLinkView(
+  { sessionId: 's-x', at: 1 }, { 's-x': { displayTitle: '处理 Bug #123', cwd: '/p' } });
+check('sessionLinkView 会话存在 → live + displayTitle', vLive.state === 'live' && vLive.title === '处理 Bug #123');
+const vDead = mod._test.sessionLinkView({ sessionId: 's-gone', at: 1 }, { 's-other': {} });
+check('sessionLinkView 会话已删（byId 非空无该行）→ dead', vDead.state === 'dead');
+check('sessionLinkView 无快照 / 列表未就绪 → unknown（显示处理时间）',
+  mod._test.sessionLinkView({ sessionId: 's', at: 1 }, null).state === 'unknown'
+  && mod._test.sessionLinkView({ sessionId: 's', at: 1 }, {}).state === 'unknown'
+  && mod._test.sessionLinkView({ sessionId: 's', at: 1 }, null).title.includes('已处理'));
+
+// openSessionLink：跳转 / 会话已删自动清 / 列表未就绪不误删 / 服务缺失降级
+let openedLink = null;
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { 's-newer': { displayTitle: '处理 Bug #123' }, s1: { cwd: '/tmp' } } }) },
+  };
+  if (name === 'uiWorkspace') return { openSession(id) { openedLink = id; } };
+  return undefined;
+};
+mod._test.saveSessionLink('acct1', card123, 's-newer');
+let rLink = mod._test.openSessionLink('acct1', card123);
+check('openSessionLink 跳到关联会话（uiWorkspace.openSession）', rLink.ok === true && openedLink === 's-newer');
+
+mod._test.saveSessionLink('acct1', card123, 's-gone');
+rLink = mod._test.openSessionLink('acct1', card123);
+check('会话已不存在 → 返回 missing 并清除关联',
+  rLink.ok === false && rLink.reason === 'missing' && mod._test.getSessionLink('acct1', card123) === null);
+
+mod._test.saveSessionLink('acct1', card123, 's-any');
+ctx.get = function (name) {
+  if (name === 'sessions') return { list: { getSnapshot: () => ({ current: null, byId: {} }) } };
+  if (name === 'uiWorkspace') return { openSession(id) { openedLink = id; } };
+  return undefined;
+};
+rLink = mod._test.openSessionLink('acct1', card123);
+check('列表未就绪（byId 空）时不误删关联、照常打开',
+  rLink.ok === true && openedLink === 's-any' && mod._test.getSessionLink('acct1', card123) !== null);
+
+ctx.get = function (name) {
+  if (name === 'sessions') return { list: { getSnapshot: () => ({ byId: { 's-any': {} } }) } };
+  return undefined;
+};
+rLink = mod._test.openSessionLink('acct1', card123);
+check('uiWorkspace 服务缺失 → unsupported（不清关联）',
+  rLink.ok === false && rLink.reason === 'unsupported' && mod._test.getSessionLink('acct1', card123) !== null);
+
+rLink = mod._test.openSessionLink('acct1', { kind: 'task', id: 999 });
+check('无关联卡片 → nolink', rLink.ok === false && rLink.reason === 'nolink');
+
+// ── 面板跳转：openSessionLink 成功即 uiWorkspace.openSession ──
+// （左侧栏全局面板入口下，openSession 内部 replaceMain("reveal") → selectPanel(null)
+//   自动切回会话视图，插件无需再跟面板——原右侧栏 per-session 的 follow 逻辑已删）
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+openedLink = null;
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { 's-live': { displayTitle: 'T' }, s1: { cwd: '/tmp' } } }) },
+  };
+  if (name === 'uiWorkspace') return { openSession(id) { openedLink = id; } };
+  return undefined;
+};
+mod._test.saveSessionLink('acct1', card123, 's-live');
+rLink = mod._test.openSessionLink('acct1', card123);
+await sleep(10);
+check('openSessionLink 跳转成功（uiWorkspace.openSession）',
+  rLink.ok === true && openedLink === 's-live');
+
+// ── 「处理」时序优化：图片预取与建会话并行；切视图后草稿立即写入；模型/附件互不阻塞 ──
+const evLog = [];
+const evFacade = {
+  draft: '',
+  setDraft(t) { evLog.push('setDraft'); this.draft = t; },
+  focus() {}, submit() {},
+  addAttachments() { evLog.push('attach'); return true; },
+};
+const evConversation = {
+  input: { for: () => evFacade },
+  createDrafts(sid, files) { evLog.push('drafts'); return files.map((f, i) => ({ id: 'd' + (i + 1), kind: 'image' })); },
+};
+const order = [];
+let slowSelectResolve = null;
+ctx.connection.rpc.call = async (channel, endpoint) => {
+  order.push(endpoint);
+  if (endpoint === 'zentao.image') {
+    return { ok: true, value: { name: '1.png', mediaType: 'image/png', base64: base64Png, bytes: 10 } };
+  }
+  return { ok: false, error: { message: 'unexpected ' + endpoint } };
+};
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ current: 's1', byId: { s1: { cwd: '/tmp' } } }) },
+    scope: () => ({}),
+    create() { order.push('create'); return 's-xy'; },
+    retain(id) { order.push('retain'); return { sessionId: id, release() {} }; },
+  };
+  if (name === 'conversation') return evConversation;
+  if (name === 'uiWorkspace') return { openSession() { order.push('open'); } };
+  if (name === 'remote.session') return {
+    selectModel: () => new Promise((res) => { slowSelectResolve = res; order.push('selectModel'); }),
+  };
+  return undefined;
+};
+// 预取必须真发 zentao.image RPC —— 先清图片缓存（前面向 file-read-1/2 的取图已入缓存）
+mod._test.imageCache.clear();
+const imgs2 = [{ url: 'http://z/file-read-1.png' }, { url: 'http://z/file-read-2.png' }];
+const drSlow = mod._test.dispatchToNewSession('## 快', imgs2, { model: { provider: 'p', model: 'm' } });
+await sleep(8);
+check('图片字节预取在 sessions.create 之前发起（与建会话并行）',
+  order.indexOf('zentao.image') !== -1 && order.indexOf('zentao.image') < order.indexOf('create'));
+check('不跳转：retain（非 openSession）后文本草稿立即写入（setDraft 先于附件注册）',
+  order.indexOf('retain') !== -1 && order.indexOf('open') === -1
+  && evLog.indexOf('setDraft') !== -1 && evLog.indexOf('setDraft') < evLog.indexOf('drafts'));
+check('selectModel 未完成时附件照常注册（并行不互等）',
+  evLog.indexOf('drafts') !== -1 && evLog.indexOf('attach') !== -1 && slowSelectResolve !== null);
+slowSelectResolve({ ok: true, value: { selected: {} } });
+const rSlow = await drSlow;
+check('并行等待全部完成后走自动发送路径',
+  rSlow.ok && rSlow.mode === 'dispatched' && rSlow.sessionId === 's-xy'
+  && rSlow.message.includes('2 张图片') && evFacade.draft === '## 快');
+
+const rpcBefore = order.filter((e) => e === 'zentao.image').length;
+const attPre = await mod._test.attachImagesToDraft(imgs2, { sessionId: 's', facade: evFacade, conversation: evConversation },
+  imgs2.map(() => ({ name: 'p.png', mediaType: 'image/png', base64: base64Png })));
+const rpcAfter = order.filter((e) => e === 'zentao.image').length;
+check('attachImagesToDraft 带预取结果时跳过 zentao.image RPC',
+  attPre.ok === true && attPre.count === 2 && rpcAfter === rpcBefore);
+
+// ── M6 处理中任务的实时状态：单面板（办公室面板已按用户要求移除）+ 常驻监控 ──
+const allMainRegs = slotRegs.filter((r) => r.opts.name === 'main');
+const allIconRegs = slotRegs.filter((r) => r.opts.name === 'sidebar.panellist');
+check('左侧栏只注册禅道一个面板（办公室面板已移除）',
+  allMainRegs.length === 1 && allIconRegs.length === 1
+  && allMainRegs[0].opts.key === 'zentao' && allIconRegs[0].opts.id === 'zentao');
+
+// link key 解析（监控从 key 还原账号/类型/id，旧值结构没有卡片信息也能工作）
+check('parseLinkKey 解析账号前缀 + kind + 数字 id',
+  JSON.stringify(mod._test.parseLinkKey('acct1/bug-123')) === JSON.stringify({ activeId: 'acct1', kind: 'bug', id: 123 }));
+check('parseLinkKey anon 前缀也可解析', mod._test.parseLinkKey('anon/task-7').kind === 'task');
+check('parseLinkKey 坏 key → null',
+  mod._test.parseLinkKey('随便') === null && mod._test.parseLinkKey('') === null && mod._test.parseLinkKey('a/feat-1') === null);
+
+// saveSessionLink 值结构（M6：补 kind/id/title 供提醒文案取名）
+lsBacking.clear();
+const savedLink = mod._test.saveSessionLink('acct1', { kind: 'bug', id: 123, title: '登录页报错' }, 's-live');
+check('saveSessionLink 值里带卡片 kind/id/title',
+  savedLink.kind === 'bug' && savedLink.id === 123 && savedLink.title === '登录页报错');
+
+// 活性推导：ask > done > running；idle / 会话已删 → null（「已处理」由 chip 表达）
+const D = mod._test.deriveLiveState;
+check('deriveLiveState：决策最优先（ask 盖过 done/running）',
+  D({ running: true, pendingInteraction: 'question', completionUnread: true }, true) === 'ask');
+check('deriveLiveState：完成未读 → done',
+  D({ running: false, pendingInteraction: null, completionUnread: true }, true) === 'done');
+check('deriveLiveState：running → running（处理中）',
+  D({ running: true, pendingInteraction: null, completionUnread: false }, true) === 'running');
+check('deriveLiveState：idle / 无状态 / 会话已删 → null（不叠徽标）',
+  D({ running: false, pendingInteraction: null, completionUnread: false }, true) === null
+  && D(null, true) === null && D({ running: true }, false) === null);
+check('deriveLiveState：自动检测永不产出 ended（已结束只能人设）',
+  [
+    { running: true, pendingInteraction: null, completionUnread: false },
+    { running: false, pendingInteraction: null, completionUnread: true },
+    { running: true, pendingInteraction: 'approval', completionUnread: true },
+    null,
+  ].every((n) => D(n, true) !== 'ended'));
+
+// 边沿事件：同帧 done+decision 只报 decision（行动需求已覆盖）
+const E = (p, n) => mod._test.watchEdges(p, n);
+check('watchEdges：完成未读置位 → done',
+  JSON.stringify(E({ running: true, pendingInteraction: null, completionUnread: false },
+    { running: false, pendingInteraction: null, completionUnread: true })) === '["done"]');
+check('watchEdges：出现决策（question）→ decision',
+  E({ running: true, pendingInteraction: null, completionUnread: false },
+    { running: true, pendingInteraction: 'question', completionUnread: false })[0] === 'decision');
+check('watchEdges：决策类型变化（question→approval）也算新决策',
+  E({ running: true, pendingInteraction: 'question', completionUnread: false },
+    { running: true, pendingInteraction: 'approval', completionUnread: false }).length === 1);
+check('watchEdges：done+decision 同帧 → 只 decision',
+  E({ running: true, pendingInteraction: null, completionUnread: false },
+    { running: false, pendingInteraction: 'plan-review', completionUnread: true }).join() === 'decision');
+check('watchEdges：无变化 / 完成未读被清除（看过了）→ 不产生事件',
+  E({ running: true, pendingInteraction: null, completionUnread: false },
+    { running: true, pendingInteraction: null, completionUnread: false }).length === 0
+  && E({ running: false, pendingInteraction: null, completionUnread: true },
+    { running: false, pendingInteraction: null, completionUnread: false }).length === 0);
+
+// 提醒文案：中性文案（无角色梗），区分完成/决策与交互类型
+const evDone = { type: 'done', sessionId: 's-live', interaction: null, entry: { kind: 'bug', id: 123, title: '登录页报错' } };
+const evAsk = { type: 'decision', sessionId: 's-live', interaction: 'question', entry: { kind: 'bug', id: 123, title: '登录页报错' } };
+const ttDone = mod._test.watchToastText(evDone);
+const ttAsk = mod._test.watchToastText(evAsk);
+check('watchToastText（完成）：标题含「任务完成」、正文含卡标识',
+  ttDone.title.includes('任务完成') && ttDone.body.includes('#123') && ttDone.body.includes('登录页报错'));
+check('watchToastText（决策）：区分交互类型（提问/审批/方案确认）',
+  ttAsk.title.includes('决策') && ttAsk.body.includes('提问')
+  && mod._test.watchToastText({ ...evAsk, interaction: 'approval' }).body.includes('审批')
+  && mod._test.watchToastText({ ...evAsk, interaction: 'plan-review' }).body.includes('方案确认'));
+
+// 监控集成：绑定 fake 服务 → 活性快照 → 边沿驱动状态翻转 → 卡片查询
+let statusMap = new Map([
+  ['s-live', { running: true, pendingInteraction: null, completionUnread: false }],
+  ['s-task', { running: true, pendingInteraction: null, completionUnread: false }],
+]);
+const statusCbs = [];
+ctx.get = function (name) {
+  if (name === 'uiSession') return {
+    sessionStatus: {
+      getSnapshot: () => statusMap,
+      subscribe(cb) { statusCbs.push(cb); return () => {}; },
+    },
+  };
+  if (name === 'sessions') return {
+    list: {
+      getSnapshot: () => ({ byId: { 's-live': { displayTitle: '会话A' }, 's-task': { displayTitle: '会话B' } } }),
+      subscribe() { return () => {}; },
+    },
+  };
+  if (name === 'uiWorkspace') return { openSession() {} };
+  return undefined;
+};
+mod._test.watchTryBind();
+check('监控绑定 uiSession.sessionStatus（订阅生效）', mod._test.watch.bound === true && statusCbs.length >= 1);
+
+mod._test.paneCache.status = { activeId: 'acct1' };
+mod._test.saveSessionLink('acct1', { kind: 'task', id: 55, title: '写周报' }, 's-task');
+mod._test.watchEval();
+let wsnap = mod._test.watchGetSnapshot();
+check('活性快照：两个处理中的会话都是 running',
+  wsnap.ready === true && wsnap.states['s-live'] === 'running' && wsnap.states['s-task'] === 'running');
+check('watchStateForCard：已关联卡片查到 running',
+  mod._test.watchStateForCard('acct1', { kind: 'bug', id: 123 }) === 'running');
+check('watchStateForCard：未关联卡片 → null',
+  mod._test.watchStateForCard('acct1', { kind: 'bug', id: 999 }) === null);
+
+// 多账号：其它账号的 link 不进当前监控
+mod._test.saveSessionLink('acct2', { kind: 'bug', id: 9, title: '别人的' }, 's-task');
+mod._test.watchEval();
+wsnap = mod._test.watchGetSnapshot();
+check('切换账号视角：只看当前激活账号的关联（acct2 不混入）',
+  wsnap.states['s-task'] === 'running' && mod._test.watchStateForCard('acct2', { kind: 'bug', id: 9 }) === null);
+
+// 状态边沿：后台跑完 → done；agent 提问 → ask；看过+idle → null
+statusMap.set('s-live', { running: false, pendingInteraction: null, completionUnread: true });
+statusCbs.forEach((cb) => cb());
+wsnap = mod._test.watchGetSnapshot();
+check('后台跑完 → 卡片活性变 done（绿色对勾徽标）',
+  wsnap.states['s-live'] === 'done' && mod._test.watchStateForCard('acct1', { kind: 'bug', id: 123 }) === 'done');
+statusMap.set('s-live', { running: false, pendingInteraction: 'question', completionUnread: false });
+statusCbs.forEach((cb) => cb());
+wsnap = mod._test.watchGetSnapshot();
+check('agent 提问 → 卡片活性变 ask（琥珀呼吸徽标）',
+  wsnap.states['s-live'] === 'ask' && mod._test.watchStateForCard('acct1', { kind: 'bug', id: 123 }) === 'ask');
+statusMap.set('s-live', { running: false, pendingInteraction: null, completionUnread: false });
+statusCbs.forEach((cb) => cb());
+wsnap = mod._test.watchGetSnapshot();
+check('看过且 idle → 活性归零（只剩会话 chip，不叠徽标）',
+  wsnap.states['s-live'] === null && mod._test.watchStateForCard('acct1', { kind: 'bug', id: 123 }) === null);
+
+// 会话删除 → 活性清零（chip 侧由 sessionLinkView 判 dead）
+ctx.get = function (name) {
+  if (name === 'uiSession') return {
+    sessionStatus: { getSnapshot: () => statusMap, subscribe(cb) { return () => {}; } },
+  };
+  if (name === 'sessions') return {
+    list: {
+      getSnapshot: () => ({ byId: { 's-live': { displayTitle: '会话A' } } }), // s-task 没了
+      subscribe() { return () => {}; },
+    },
+  };
+  return undefined;
+};
+mod._test.watchEval();
+wsnap = mod._test.watchGetSnapshot();
+check('关联会话被删 → 活性清零（不亮徽标）', wsnap.states['s-task'] === null);
+
+// ── 处理进度持久化（states.v1）+ 陈旧关联清理 ──
+// M6 活性状态来自内存 store：DSH 关闭期间会话跑完的完成事件会丢。
+// states.v1 落盘 + liveOf 兜底 → 重启/重开面板后徽标可恢复处理进度；
+// links.lastSeen + cleanupStaleLinks → 不在「指派给我」列表超宽限期的事项清理。
+const SKEY = 'dsh-zentao-panel.states.v1';
+const NOW = 1761000000000;
+const H = 3600 * 1000;
+const TT = mod._test;
+
+lsBacking.set(SKEY, '{oops');
+check('states.v1 存储损坏时读作空表不抛错（自愈）', typeof TT.readStateMap() === 'object');
+lsBacking.delete(SKEY);
+
+check('statusMapReady：Map 有条目 true / 空 Map false / null false',
+  TT.statusMapReady(new Map([['s', {}]])) === true
+  && TT.statusMapReady(new Map()) === false && TT.statusMapReady(null) === false);
+
+// syncPersistedStates：落盘 / at 稳定 / 粘性 done / 瞬态删除 / 重启防护 / 会话删除
+lsBacking.clear();
+const sEnts = [{ key: 'acct1/bug-123', sessionId: 's1', kind: 'bug', id: 123, title: 'x' }];
+const SOPT = { byId: { s1: {} }, byIdReady: true, statusReady: true };
+TT.syncPersistedStates(sEnts, { s1: 'running' }, SOPT, NOW);
+check('syncPersistedStates：running → 落盘 {sessionId, state, at}',
+  JSON.stringify(TT.readStateMap()['acct1/bug-123']) === JSON.stringify({ sessionId: 's1', state: 'running', at: NOW }));
+TT.syncPersistedStates(sEnts, { s1: 'running' }, SOPT, NOW + 5000);
+check('syncPersistedStates：同状态不刷新 at（进度时间稳定）',
+  TT.readStateMap()['acct1/bug-123'].at === NOW);
+TT.syncPersistedStates(sEnts, { s1: 'done' }, SOPT, NOW + 9000);
+check('syncPersistedStates：状态变化刷新 at', TT.readStateMap()['acct1/bug-123'].at === NOW + 9000);
+TT.syncPersistedStates(sEnts, { s1: null }, SOPT, NOW + 10000);
+check('syncPersistedStates：实时归零后 done 粘性保留（进度记录）',
+  TT.readStateMap()['acct1/bug-123'].state === 'done');
+TT.syncPersistedStates(sEnts, { s1: 'running' }, SOPT, NOW + 11000);
+TT.syncPersistedStates(sEnts, { s1: null }, SOPT, NOW + 12000);
+check('syncPersistedStates：running 归零且状态源就绪 → 升级为 done（真机坑：正看着的会话跑完 completionUnread 不置位，旧逻辑删记录漏成「无状态」）',
+  TT.readStateMap()['acct1/bug-123'].state === 'done' && TT.readStateMap()['acct1/bug-123'].at === NOW + 12000);
+TT.syncPersistedStates(sEnts, { s1: 'running' }, { byId: { s1: {} }, byIdReady: true, statusReady: false, sessionSeen: { s1: true } }, NOW + 12500);
+TT.syncPersistedStates(sEnts, { s1: null }, { byId: { s1: {} }, byIdReady: true, statusReady: false, sessionSeen: { s1: true } }, NOW + 12700);
+check('syncPersistedStates：状态源全空但该会话有行（真实 idle）→ 照常升级 done',
+  TT.readStateMap()['acct1/bug-123'].state === 'done');
+TT.syncPersistedStates(sEnts, { s1: 'running' }, { byId: { s1: {} }, byIdReady: true, statusReady: false }, NOW + 13000);
+TT.syncPersistedStates(sEnts, { s1: null }, { byId: { s1: {} }, byIdReady: true, statusReady: false }, NOW + 14000);
+check('syncPersistedStates：无结束信号（状态源空且无该会话行，DSH 刚启动）→ 不动（防重启风暴）',
+  TT.readStateMap()['acct1/bug-123'].state === 'running');
+TT.syncPersistedStates(sEnts, { s1: 'ask' }, SOPT, NOW + 14500);
+TT.syncPersistedStates(sEnts, { s1: null }, SOPT, NOW + 15000);
+check('syncPersistedStates：ask 归零且状态源就绪 → 删记录（用户已回应，非完成）',
+  TT.readStateMap()['acct1/bug-123'] === undefined);
+TT.syncPersistedStates(sEnts, { s1: 'done' }, { byId: { s1: {} }, byIdReady: true, statusReady: false }, NOW + 15500);
+TT.syncPersistedStates(sEnts, { s1: null }, { byId: {}, byIdReady: true, statusReady: false }, NOW + 16000);
+check('syncPersistedStates：会话被删 → done 也删（与 chip「会话已删除」语义一致）',
+  TT.readStateMap()['acct1/bug-123'] === undefined);
+
+// resolveLiveState：实时优先 + 持久化兜底（done 粘性 / 瞬态仅在监控未就绪时）
+const R = TT.resolveLiveState;
+check('resolveLiveState：实时命中优先（since 为 null）',
+  R({ sessionId: 's1' }, { ready: true, states: { s1: 'running' } }, { state: 'done', at: 1 }).state === 'running'
+  && R({ sessionId: 's1' }, { ready: true, states: { s1: 'running' } }, { state: 'done', at: 1 }).since === null);
+check('resolveLiveState：实时归零 → 持久化 done 兜底（带 since 供徽标显示时间）',
+  JSON.stringify(R({ sessionId: 's1' }, { ready: true, statusReady: true, states: { s1: null } }, { state: 'done', at: 123 }))
+  === JSON.stringify({ state: 'done', since: 123 }));
+check('resolveLiveState：监控未就绪 → 瞬态（running/ask）兜底显示（重启过渡期）',
+  R({ sessionId: 's1' }, { ready: false }, { state: 'running', at: 5 }).state === 'running'
+  && R({ sessionId: 's1' }, null, { state: 'ask', at: 5 }).state === 'ask');
+check('resolveLiveState：监控就绪后瞬态不再兜底（重启前死掉的 turn 不显示「处理中」）',
+  R({ sessionId: 's1' }, { ready: true, statusReady: true, states: {} }, { state: 'running', at: 5 }) === null
+  && R({ sessionId: 's1' }, { ready: true, statusReady: true, states: {} }, { state: 'ask', at: 5 }) === null);
+check('resolveLiveState：无关联 / 无持久化 → null',
+  R(null, {}, null) === null && R({ sessionId: 's1' }, { ready: true, states: {} }, null) === null);
+
+// cleanupStaleLinks：在线刷 lastSeen / 宽限期保留 / 超期删 / 他账号不动 / 孤儿清理 / 幂等
+// （清理会 watchPoke → watchEval：byId 覆盖全部关联会话、状态源为空，模拟真实存活场景）
+ctx.get = function (name) {
+  if (name === 'uiSession') return {
+    sessionStatus: { getSnapshot: () => new Map(), subscribe() { return () => {}; } },
+  };
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ byId: { 's-1': {}, 's-2': {}, 's-3': {}, 's-9': {} } }), subscribe() { return () => {}; } },
+  };
+  return undefined;
+};
+lsBacking.clear();
+const mkLink = (id, at, lastSeen) => ({ sessionId: 's-' + id, at, lastSeen, kind: 'bug', id, title: 't' + id });
+lsBacking.set('dsh-zentao-panel.links.v1', JSON.stringify({
+  'acct1/bug-1': mkLink(1, NOW - 100 * H, NOW - 100 * H), // 在线
+  'acct1/bug-2': mkLink(2, NOW - 100 * H, NOW - 7 * H),   // 离线 7h（8h 宽限内）
+  'acct1/bug-3': mkLink(3, NOW - 200 * H),                // 旧格式无 lastSeen，离线 200h
+  'acct1/bug-4': mkLink(4, NOW - 100 * H, NOW - 9 * H),   // 离线 9h（超 8h 宽限）
+  'acct2/bug-9': mkLink(9, NOW - 200 * H),                // 其他账号
+}));
+lsBacking.set(SKEY, JSON.stringify({
+  'acct1/bug-2': { sessionId: 's-2', state: 'done', at: NOW - 7 * H },
+  'acct1/bug-3': { sessionId: 's-3', state: 'done', at: NOW - 200 * H },
+  'acct1/bug-4': { sessionId: 's-4', state: 'done', at: NOW - 9 * H },
+  'acct2/bug-9': { sessionId: 's-9', state: 'done', at: NOW - 200 * H },
+  'acct1/bug-7': { sessionId: 's-7', state: 'done', at: NOW - 200 * H }, // 孤儿（无 link）
+}));
+const mineCards = [{ kind: 'task', id: 500 }, { kind: 'bug', id: 1 }];
+const cleaned1 = TT.cleanupStaleLinks('acct1', mineCards, NOW);
+const lm2 = JSON.parse(lsBacking.get('dsh-zentao-panel.links.v1'));
+const sm2 = JSON.parse(lsBacking.get(SKEY));
+check('cleanupStaleLinks：超期离线删除（旧格式无 lastSeen 退回 at 计时），links 与进度一起删',
+  lm2['acct1/bug-3'] === undefined && sm2['acct1/bug-3'] === undefined);
+check('cleanupStaleLinks：宽限期内（7h < 8h）保留', lm2['acct1/bug-2'] !== undefined && sm2['acct1/bug-2'].state === 'done');
+check('cleanupStaleLinks：超过 8h 宽限（9h）删除（2026-10-29 用户要求：72h 太长，回来会带旧状态）',
+  lm2['acct1/bug-4'] === undefined && sm2['acct1/bug-4'] === undefined
+  && TT.LINK_GRACE_MS === 8 * 3600 * 1000);
+check('cleanupStaleLinks：其他账号条目不动', lm2['acct2/bug-9'] !== undefined && sm2['acct2/bug-9'] !== undefined);
+check('cleanupStaleLinks：孤儿进度记录（无关联）同样清理', sm2['acct1/bug-7'] === undefined);
+check('cleanupStaleLinks：在线条目刷新 lastSeen（计时基准重置）', lm2['acct1/bug-1'].lastSeen === NOW);
+check('cleanupStaleLinks：有清理动作返回 true', cleaned1 === true);
+check('cleanupStaleLinks：幂等（紧接着再跑无动作 → false，1h 内不重写 lastSeen）',
+  TT.cleanupStaleLinks('acct1', mineCards, NOW + 1000) === false
+  && JSON.parse(lsBacking.get('dsh-zentao-panel.links.v1'))['acct1/bug-1'].lastSeen === NOW);
+
+// 本地标记（旗标/隐藏）随 cleanup 清理：在线卡刷新 lastSeen，离线超宽限删除，他账号不动
+lsBacking.delete('dsh-zentao-panel.marks.v1');
+TT.toggleCardMark('acct1', { kind: 'bug', id: 1 }, 'flag', NOW);            // 在线卡（mineCards 内）
+TT.toggleCardMark('acct1', { kind: 'task', id: 99 }, 'hide', NOW);          // 离线孤儿
+TT.toggleCardMark('acct2', { kind: 'bug', id: 1 }, 'flag', NOW - 100 * 3600 * 1000); // 他账号 + 超宽限
+check('cleanupStaleLinks 顺带清 marks：在线保留 / 孤儿超宽限删 / 他账号不动',
+  TT.cleanupStaleLinks('acct1', mineCards, NOW + 80 * 3600 * 1000) === true
+  && TT.readMarkMap()['acct1/bug-1'] !== undefined
+  && TT.readMarkMap()['acct1/task-99'] === undefined
+  && TT.readMarkMap()['acct2/bug-1'] !== undefined);
+
+// ── 处理状态手动修正（2026-10-27 用户要求：已完成状态偶尔会丢）──
+// states.v1 加 manual 标记：resolveLiveState 优先取它、syncPersistedStates 不改写；
+// 卡片下拉 / 详情 chip 随时改，「自动」清除覆盖回到会话检测。
+lsBacking.clear();
+const manCard = { kind: 'bug', id: 321, title: '手动状态卡' };
+TT.setManualState('acct1', manCard, 'done', NOW);
+const manRec = TT.readStateMap()['acct1/bug-321'];
+check('setManualState：无关联会话也能设，落盘 {sessionId:null, state, at, manual, lastSeen}',
+  manRec && manRec.state === 'done' && manRec.manual === true && manRec.sessionId === null
+  && manRec.at === NOW && manRec.lastSeen === NOW);
+check('resolveLiveState：手动状态优先（无关联会话也返回，带 manual 标记）',
+  JSON.stringify(TT.resolveLiveState(null, { ready: true, statusReady: true, states: {} }, manRec))
+  === JSON.stringify({ state: 'done', since: NOW, manual: true })
+  && TT.resolveLiveState({ sessionId: 's1' }, { ready: true, states: { s1: 'running' } }, manRec).state === 'done');
+TT.syncPersistedStates([{ key: 'acct1/bug-321', sessionId: 's1', kind: 'bug', id: 321 }],
+  { s1: 'running' }, SOPT, NOW + 1000);
+check('syncPersistedStates：手动状态不被自动评估覆盖（实时 running 也不改）',
+  TT.readStateMap()['acct1/bug-321'].state === 'done'
+  && TT.readStateMap()['acct1/bug-321'].manual === true);
+TT.saveReply('acct1', { kind: 'bug', id: 321 }, 's1', '旧会话的回复');
+TT.syncPersistedStates([{ key: 'acct1/bug-321', sessionId: 's1', kind: 'bug', id: 321 }],
+  { s1: null }, { byId: {}, byIdReady: true, statusReady: true }, NOW + 2000);
+check('syncPersistedStates：关联会话被删也不删手动状态（人设的比会话存活权威），旧结果摘要照常清掉',
+  TT.readStateMap()['acct1/bug-321'] !== undefined
+  && TT.readReplyMap()['acct1/bug-321'] === undefined);
+
+lsBacking.clear();
+TT.saveSessionLink('acct1', { kind: 'bug', id: 322, title: 'y' }, 's-322');
+TT.setManualState('acct1', { kind: 'bug', id: 322, title: 'y' }, 'ask', NOW);
+check('setManualState：有关联会话时带上 sessionId（chip / 会话删除判定照常）',
+  TT.readStateMap()['acct1/bug-322'].sessionId === 's-322'
+  && TT.readStateMap()['acct1/bug-322'].state === 'ask');
+TT.saveSessionLink('acct1', { kind: 'bug', id: 322, title: 'y' }, 's-323');
+check('saveSessionLink：再处理换会话 → 手动状态作废（新一轮处理重新自动判断）',
+  TT.readStateMap()['acct1/bug-322'] === undefined);
+
+lsBacking.clear();
+const manOrphan = { kind: 'bug', id: 77, title: 'z' };
+TT.setManualState('acct1', manOrphan, 'done', NOW - 100 * H);
+const keepOnline = TT.cleanupStaleLinks('acct1', [manOrphan], NOW);
+check('cleanupStaleLinks：手动状态（无 link）在卡片仍在线时保留，只刷新 lastSeen',
+  keepOnline === true && TT.readStateMap()['acct1/bug-77'] !== undefined
+  && TT.readStateMap()['acct1/bug-77'].lastSeen === NOW
+  && TT.cleanupStaleLinks('acct1', [manOrphan], NOW + 1000) === false);
+check('cleanupStaleLinks：手动状态在卡片离开列表超宽限期后清（与 links 同规则）',
+  TT.cleanupStaleLinks('acct1', [], NOW + 80 * H) === true
+  && TT.readStateMap()['acct1/bug-77'] === undefined);
+TT.setManualState('acct1', { kind: 'bug', id: 78 }, 'done', NOW);
+TT.setManualState('acct1', { kind: 'bug', id: 78 }, null, NOW);
+TT.setManualState('acct1', { kind: 'bug', id: 78 }, 'bogus', NOW);
+check('setManualState：null / 非法值 = 清除手动设置（回到自动检测）',
+  TT.readStateMap()['acct1/bug-78'] === undefined);
+
+// ── 「已结束」手动终态（2026-10-27 用户要求）：只能人设、覆盖自动结果、排序沉底、看板隐藏 ──
+lsBacking.clear();
+TT.setManualState('acct1', { kind: 'bug', id: 323, title: '人工收尾卡' }, 'ended', NOW);
+check('setManualState：已结束可手动设置并落盘（manual 条目）',
+  TT.readStateMap()['acct1/bug-323'].state === 'ended'
+  && TT.readStateMap()['acct1/bug-323'].manual === true);
+check('resolveLiveState：已结束压过自动检测（实时 done/running 都不显示）',
+  TT.resolveLiveState({ sessionId: 's1' }, { ready: true, statusReady: true, states: { s1: 'done' } },
+    TT.readStateMap()['acct1/bug-323']).state === 'ended'
+  && TT.resolveLiveState({ sessionId: 's1' }, { ready: true, states: { s1: 'running' } },
+    TT.readStateMap()['acct1/bug-323']).state === 'ended');
+TT.syncPersistedStates([{ key: 'acct1/bug-323', sessionId: 's1', kind: 'bug', id: 323 }],
+  { s1: 'running' }, SOPT, NOW + 1000);
+check('syncPersistedStates：已结束不被自动评估改回 running/done',
+  TT.readStateMap()['acct1/bug-323'].state === 'ended');
+const endedLive = (c) => (c.id === 323 ? 'ended' : c.id === 1 ? 'done' : null);
+check('sortCards smart：已结束沉到最底（done 与禅道终态之后）',
+  TT.sortCards([
+    { kind: 'bug', id: 323, status: 'active' },              // 已结束
+    { kind: 'bug', id: 1, status: 'active' },                // done
+    { kind: 'bug', id: 2, status: 'closed' },                // 禅道终态
+    { kind: 'bug', id: 3, status: 'active', deadline: '2026-10-21' },
+  ], 'smart', NOW, endedLive).map((c) => c.id).join() === '3,1,2,323');
+check('sortCards deadline/pri：已结束也沉底（终态而非「活动」状态）',
+  TT.sortCards([
+    { kind: 'bug', id: 323, status: 'active', deadline: '2026-10-20', pri: 1 },
+    { kind: 'bug', id: 1, status: 'active', deadline: '2026-12-01', pri: 3 },
+    { kind: 'bug', id: 3, status: 'closed', pri: 2 },
+  ], 'deadline', NOW, endedLive).map((c) => c.id).join() === '1,3,323'
+  && TT.sortCards([
+    { kind: 'bug', id: 323, status: 'active', deadline: '2026-10-20', pri: 1 },
+    { kind: 'bug', id: 1, status: 'active', deadline: '2026-12-01', pri: 3 },
+    { kind: 'bug', id: 3, status: 'closed', pri: 2 },
+  ], 'pri', NOW, endedLive).map((c) => c.id).join() === '3,1,323');
+check('sortCards origin：保持禅道原序（显式「默认顺序」不掺状态）',
+  TT.sortCards([{ kind: 'bug', id: 323 }, { kind: 'bug', id: 1 }], 'origin', NOW, endedLive)
+    .map((c) => c.id).join() === '323,1');
+
+// saveSessionLink 值带 lastSeen；再处理会清掉旧进度记录
+lsBacking.clear();
+const nl = TT.saveSessionLink('acct1', { kind: 'bug', id: 42, title: 'x' }, 's-42');
+check('saveSessionLink 值带 lastSeen（清理计时基准）', Number(nl.lastSeen) > 0 && Number(nl.lastSeen) === Number(nl.at));
+TT.syncPersistedStates([{ key: 'acct1/bug-42', sessionId: 's-42', kind: 'bug', id: 42, title: 'x' }],
+  { 's-42': 'done' }, SOPT, NOW);
+TT.saveSessionLink('acct1', { kind: 'bug', id: 42, title: 'x' }, 's-43');
+check('saveSessionLink 换新会话 → 旧进度记录作废（防徽标显示旧会话陈旧状态）',
+  TT.readStateMap()['acct1/bug-42'] === undefined);
+
+// watchEval 联动：评估落盘 + 快照带 statusReady 闸门
+lsBacking.clear();
+ctx.get = function (name) {
+  if (name === 'uiSession') return {
+    sessionStatus: { getSnapshot: () => new Map([['s-w', { running: true }]]), subscribe() { return () => {}; } },
+  };
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ byId: { 's-w': {} } }), subscribe() { return () => {}; } },
+  };
+  return undefined;
+};
+TT.paneCache.status = { activeId: 'acct1' };
+TT.saveSessionLink('acct1', { kind: 'task', id: 77, title: 'y' }, 's-w');
+TT.watchEval();
+check('watchEval 联动：评估出的 running 状态落盘 states.v1',
+  TT.readStateMap()['acct1/task-77'] && TT.readStateMap()['acct1/task-77'].state === 'running');
+check('watchEval 快照带 statusReady（瞬态兜底显示的闸门）', TT.watchGetSnapshot().statusReady === true);
+
+// 重启恢复场景：面板重开/DSH 重启 → 徽标从持久化进度恢复
+const infoRestart = TT.resolveLiveState(
+  { sessionId: 's-w' },
+  { ready: false, activeId: 'acct1', states: {} },   // 新进程监控还没起来
+  TT.readStateMap()['acct1/task-77']);
+check('重启场景：监控未就绪 → 持久化 running 兜底显示',
+  infoRestart && infoRestart.state === 'running' && infoRestart.since > 0);
+TT.syncPersistedStates([{ key: 'acct1/task-77', sessionId: 's-w', kind: 'task', id: 77, title: 'y' }],
+  { 's-w': 'done' }, { byId: { 's-w': {} }, byIdReady: true, statusReady: true }, NOW);
+const infoDone = TT.resolveLiveState(
+  { sessionId: 's-w' },
+  { ready: true, statusReady: true, states: { 's-w': null } }, // 就绪但实时归零（重启期间跑完）
+  TT.readStateMap()['acct1/task-77']);
+check('重启场景：关闭期间跑完（完成事件已丢）→ 持久化 done 仍显示「已完成」',
+  infoDone && infoDone.state === 'done' && infoDone.since === NOW);
+
+// ── 列表搜索 + 排序 + 临期/逾期（2026-10-25 提案 1）──
+// deadlineInfo 的解析基准是本地时区日期串，测试用本地零点作 now 保证与平台无关
+const NOWD = Date.parse('2026-10-25T00:00:00');
+const DI = (d) => TT.deadlineInfo(d, NOWD);
+check('deadlineInfo：截止日已过 → overdue + 可算逾期天数',
+  DI('2026-10-20').overdue === true && DI('2026-10-20').soon === false
+  && TT.overdueDays(DI('2026-10-20')) === 5);
+check('deadlineInfo：≤3 天 → soon（含边界）',
+  DI('2026-10-25').soon === true && DI('2026-10-27').soon === true && DI('2026-10-28').soon === false);
+check('deadlineInfo：远期 → 正常；空/坏值 → null',
+  DI('2026-11-20').overdue === false && DI('2026-11-20').soon === false
+  && TT.deadlineInfo(null, NOWD) === null && DI('乱写') === null);
+check('isFinalCard：done/closed/cancel 终态 → true，进行中 → false',
+  TT.isFinalCard({ status: 'done' }) === true && TT.isFinalCard({ status: 'closed' }) === true
+  && TT.isFinalCard({ status: 'cancel' }) === true && TT.isFinalCard({ status: 'doing' }) === false
+  && TT.isFinalCard(null) === false);
+
+const sc = [
+  { kind: 'bug', id: 5, title: '无截止', status: 'wait' },
+  { kind: 'bug', id: 1, title: '已关闭', status: 'closed', deadline: '2026-10-20' },
+  { kind: 'bug', id: 2, title: '逾期', status: 'doing', deadline: '2026-10-19' },
+  { kind: 'bug', id: 3, title: '临期', status: 'doing', deadline: '2026-10-26' },
+  { kind: 'bug', id: 4, title: '远期', status: 'doing', deadline: '2026-11-26' },
+];
+check('sortCards smart：逾期 > 临期 > 有截止 > 无截止，终态沉底',
+  TT.sortCards(sc, 'smart', NOWD).map((c) => c.id).join(',') === '2,3,4,5,1');
+const sc2 = [
+  { id: 10, deadline: '2026-11-05', pri: 2 },
+  { id: 11, deadline: '2026-11-01', pri: 3 },
+  { id: 12, deadline: '2026-11-01', pri: 1 },
+  { id: 9, deadline: '2026-11-01', pri: 1 },
+];
+check('sortCards smart 段内：截止↑ → 优先级↑ → id↓',
+  TT.sortCards(sc2, 'smart', NOWD).map((c) => c.id).join(',') === '12,9,11,10');
+check('sortCards deadline：截止↑，无截止最后，终态沉底',
+  TT.sortCards([{ id: 1 }, { id: 2, deadline: '2026-11-01' }, { id: 3, status: 'done', deadline: '2026-10-01' }], 'deadline', NOWD)
+    .map((c) => c.id).join(',') === '2,1,3');
+check('sortCards pri：优先级↑，缺省沉底',
+  TT.sortCards([{ id: 1, pri: 3 }, { id: 2, pri: 1 }, { id: 3 }], 'pri', NOWD)
+    .map((c) => c.id).join(',') === '2,1,3');
+check('sortCards origin：保持禅道返回顺序',
+  TT.sortCards(sc, 'origin', NOWD).map((c) => c.id).join(',') === '5,1,2,3,4');
+check('sortCards 未知 mode → 回落 smart', JSON.stringify(TT.sortCards(sc, 'garbage', NOWD)) === JSON.stringify(TT.sortCards(sc, 'smart', NOWD)));
+
+// ── smart 排序融合实时状态：ask > running > 普通 > done > 终态（2026-10-25 提案 2）──
+check('sortCards smart + liveOf：等你决策置顶（无截止的 ask 卡压过逾期卡）',
+  TT.sortCards(sc, 'smart', NOWD, (c) => (c.id === 5 ? 'ask' : null)).map((c) => c.id).join(',') === '5,2,3,4,1');
+check('sortCards smart + liveOf：ask > running > 普通 > done，终态沉底',
+  TT.sortCards(sc, 'smart', NOWD, (c) => ({ 2: 'ask', 3: 'running', 4: 'done' }[c.id] || null))
+    .map((c) => c.id).join(',') === '2,3,5,4,1');
+check('sortCards smart + liveOf：终态仍最先沉底（live 也压不过终态）',
+  TT.sortCards([{ kind: 'bug', id: 9, status: 'closed' }, { kind: 'bug', id: 8, status: 'doing' }], 'smart', NOWD,
+    (c) => (c.id === 9 ? 'ask' : null)).map((c) => c.id).join(',') === '8,9');
+check('sortCards smart + liveOf：done 沉到普通之后（已处理完但禅道未终态）',
+  TT.sortCards([
+    { kind: 'bug', id: 7, status: 'doing', deadline: '2026-11-26' }, // 远期 done
+    { kind: 'bug', id: 6, status: 'doing', deadline: '2026-10-26' }, // 临期普通
+  ], 'smart', NOWD, (c) => (c.id === 7 ? 'done' : null)).map((c) => c.id).join(',') === '6,7');
+check('sortCards smart + liveOf：桶内仍按 截止↑ → 优先级↑ 排',
+  TT.sortCards(sc2, 'smart', NOWD, () => 'running').map((c) => c.id).join(',') === '12,9,11,10');
+check('sortCards smart + liveOf 传非函数 → 行为与原来一致',
+  TT.sortCards(sc, 'smart', NOWD, undefined).map((c) => c.id).join(',') === '2,3,4,5,1');
+check('sortCards deadline/pri 模式不受 liveOf 影响（用户显式选了维度）',
+  JSON.stringify(TT.sortCards(sc, 'deadline', NOWD, (c) => (c.id === 2 ? 'ask' : null))) === JSON.stringify(TT.sortCards(sc, 'deadline', NOWD))
+  && JSON.stringify(TT.sortCards(sc, 'pri', NOWD, (c) => (c.id === 2 ? 'ask' : null))) === JSON.stringify(TT.sortCards(sc, 'pri', NOWD)));
+
+// ── 会话头部反向跳转（Idea 3，2026-10-25）：slot 注册 + links 反查 + 跳转编排 ──
+const headerReg = slotRegs.find((r) => r.opts.name === 'conversation.session.header.actions');
+check('slot: conversation.session.header.actions 已注册（id=zentao-card）',
+  Boolean(headerReg) && headerReg.opts.id === 'zentao-card' && typeof headerReg.comp === 'function');
+check('header inject(sessionId) → zentaoSessionId prop（scope:session 的 runInject 传参）',
+  JSON.stringify(headerReg.opts.inject('sess-1')) === JSON.stringify({ zentaoSessionId: 'sess-1' }));
+
+const hdrLinks = {
+  'acct1/bug-101': { sessionId: 'sess-a', at: 1000, kind: 'bug', id: 101, title: '旧关联' },
+  'acct1/task-9': { sessionId: 'sess-b', at: NOW, kind: 'task', id: 9, title: '修复登录' },
+  'acct2/bug-101': { sessionId: 'sess-c', at: NOW + 1, kind: 'bug', id: 101, title: '另一个账号' },
+};
+check('findLinkBySession：命中返回 parsed（含账号/类型/id）',
+  (() => { const f = TT.findLinkBySession(hdrLinks, 'sess-b'); return f && f.parsed.activeId === 'acct1' && f.parsed.kind === 'task' && String(f.parsed.id) === '9'; })());
+check('findLinkBySession：同一 sessionId 多条 → at 最新',
+  TT.findLinkBySession({ 'a/bug-1': { sessionId: 's', at: 1 }, 'a/bug-2': { sessionId: 's', at: 5 } }, 's').key === 'a/bug-2');
+check('findLinkBySession：无关联 / 空 / __proto__ → null',
+  TT.findLinkBySession(hdrLinks, 'sess-x') === null && TT.findLinkBySession(null, 's') === null
+  && TT.findLinkBySession({ __proto__: { 'x/bug-1': { sessionId: 's', at: 1 } } }, 's') === null);
+check('findFocusCard：kind+id 匹配（列表 id 数字 / focus id 字符串）',
+  TT.findFocusCard([{ kind: 'bug', id: 101 }, { kind: 'task', id: 9 }], { kind: 'bug', id: '101' }).kind === 'bug'
+  && TT.findFocusCard([{ kind: 'bug', id: 101 }], { kind: 'bug', id: '102' }) === null
+  && TT.findFocusCard([{ kind: 'bug', id: 1 }], null) === null);
+
+// 跳转编排（注入 rpc/selectPanel，重置 paneCache 单例字段）
+const pc = TT.paneCache;
+const resetPane = (activeId) => {
+  pc.status = activeId ? { activeId, configured: true } : null;
+  pc.tab = 'task'; pc.mine = { cards: [] }; pc.detailCard = { kind: 'bug', id: 1 }; pc.focus = null;
+};
+resetPane('acct1');
+let selected = null; let switchCalls = [];
+const jumpDeps = {
+  selectPanel: (id) => { selected = id; },
+  rpc: (ep, payload) => { switchCalls.push({ ep, payload }); return Promise.resolve({ ok: true, value: { activeId: payload.id, configured: true } }); },
+};
+// links.v1 写入 sess-b（acct1/task-9，与 paneCache.status.activeId 同账号）
+window.localStorage.setItem('dsh-zentao-panel.links.v1', JSON.stringify({ 'acct1/task-9': hdrLinks['acct1/task-9'] }));
+pc.tab = 'bug'; // 先偏离目标值，验证 jump 确实写了 tab
+const rSame = await TT.jumpToZentaoCard('sess-b', jumpDeps);
+check('jump：同账号 → 直接跳（不切账号），写 tab+focus，selectPanel 收到 zentao',
+  rSame.ok === true && switchCalls.length === 0 && selected === 'zentao'
+  && pc.tab === 'task' && pc.focus && pc.focus.kind === 'task' && String(pc.focus.id) === '9');
+// 异账号：sess-c 属 acct2
+resetPane('acct1'); selected = null; switchCalls = [];
+window.localStorage.setItem('dsh-zentao-panel.links.v1', JSON.stringify({ 'acct2/bug-101': hdrLinks['acct2/bug-101'] }));
+const rSwitch = await TT.jumpToZentaoCard('sess-c', jumpDeps);
+check('jump：卡片属其他账号 → 先 zentao.switch 再跳，status 换新、旧 mine/detail 清空',
+  rSwitch.ok === true && switchCalls.length === 1 && switchCalls[0].ep === 'zentao.switch'
+  && switchCalls[0].payload.id === 'acct2' && pc.status.activeId === 'acct2'
+  && pc.mine === null && pc.detailCard === null && selected === 'zentao'
+  && pc.tab === 'bug' && pc.focus && pc.focus.kind === 'bug' && String(pc.focus.id) === '101');
+// switch 被拒 → 不跳
+resetPane('acct1'); selected = null;
+const rSwFail = await TT.jumpToZentaoCard('sess-c', {
+  selectPanel: jumpDeps.selectPanel,
+  rpc: () => Promise.resolve({ ok: false, error: { message: 'no such account' } }),
+});
+check('jump：switch 被拒 → reason=switch，不调 selectPanel、不写 focus',
+  rSwFail.ok === false && rSwFail.reason === 'switch' && selected === null && pc.focus === null);
+// selectPanel 抛错 → 回滚（links.v1 当前是 acct2/bug-101=sess-c，重置回同账号）
+resetPane('acct1'); pc.tab = 'bug';
+window.localStorage.setItem('dsh-zentao-panel.links.v1', JSON.stringify({ 'acct1/task-9': hdrLinks['acct1/task-9'] }));
+const rPanel = await TT.jumpToZentaoCard('sess-b', { selectPanel: () => { throw new Error('not registered'); } });
+check('jump：selectPanel 抛错 → reason=panel，tab/focus 回滚',
+  rPanel.ok === false && rPanel.reason === 'panel' && pc.focus === null && pc.tab === 'bug');
+// 无关联
+resetPane('acct1');
+const rNo = await TT.jumpToZentaoCard('sess-none', jumpDeps);
+check('jump：无关联会话 → reason=nolink', rNo.ok === false && rNo.reason === 'nolink');
+
+// 默认分支（不注入 deps → lookupService('layout')）：selectPanel 是依赖 this 的实例方法，
+// 必须以方法形式调用——抽成裸函数 this=undefined 直接 throw（dsh-pocket #117 同款坑，真机踩过）
+resetPane('acct1'); pc.tab = 'bug';
+window.localStorage.setItem('dsh-zentao-panel.links.v1', JSON.stringify({ 'acct1/task-9': hdrLinks['acct1/task-9'] }));
+const layoutSvc = {
+  bound: false,
+  // 模拟真实 layout.selectPanel：内部依赖实例状态（this.panels），this 丢失即 throw
+  selectPanel(id) {
+    if (this !== layoutSvc || !Object.prototype.hasOwnProperty.call(layoutSvc, 'bound')) throw new Error('this lost');
+    this.bound = true; this._id = id;
+  },
+};
+const origGet = ctx.get;
+ctx.get = (name) => (name === 'layout' ? layoutSvc : undefined);
+const rDefault = await TT.jumpToZentaoCard('sess-b', {});
+ctx.get = origGet;
+check('jump：默认分支走 lookupService → layout.selectPanel 以方法形式调用（this 正确绑定）',
+  rDefault.ok === true && layoutSvc.bound === true && layoutSvc._id === 'zentao'
+  && pc.tab === 'task' && pc.focus && pc.focus.kind === 'task');
+layoutSvc.bound = false;
+pc.focus = null; pc.tab = 'bug'; // 重置：回滚断言期望恢复到点击前的空 focus
+ctx.get = (name) => (name === 'layout' ? { selectPanel: layoutSvc.selectPanel } : undefined); // 换宿主对象调用 → this 丢失
+const rDetach = await TT.jumpToZentaoCard('sess-b', {});
+ctx.get = origGet;
+check('jump：this 丢失的调用形态被兜住 → reason=panel 且回滚，不静默炸',
+  rDetach.ok === false && rDetach.reason === 'panel' && rDetach.message.includes('this lost')
+  && pc.focus === null && pc.tab === 'bug' && layoutSvc.bound === false);
+
+// header 按钮组件渲染（leftWired 已在 apply 注册左侧栏时置 true；links.v1 当前指 sess-b）
+const btnNode = TT.ZentaoHeaderAction({ zentaoSessionId: 'sess-b' });
+check('ZentaoHeaderAction：有关联 → 渲染 ztp-hbtn 按钮（图标 + 「禅道」）',
+  btnNode && btnNode.type === 'button' && btnNode.props.className === 'ztp-hbtn'
+  && btnNode.props.title.includes('回到禅道面板') && Array.isArray(btnNode.children) && btnNode.children.length === 2);
+check('ZentaoHeaderAction：无关联 / 无 sessionId → 不渲染',
+  TT.ZentaoHeaderAction({ zentaoSessionId: 'sess-x' }) === null && TT.ZentaoHeaderAction({}) === null);
+window.localStorage.removeItem('dsh-zentao-panel.links.v1');
+
+const mcard = { kind: 'bug', id: 123, title: '登录页报错', status: 'active', openedBy: '张三' };
+check('matchSearch：标题 / 裸 id / #id / 状态名 / 创建人命中',
+  TT.matchSearch(mcard, '登录') === true && TT.matchSearch(mcard, '123') === true
+  && TT.matchSearch(mcard, '#123') === true && TT.matchSearch({ ...mcard, status: 'doing' }, '进行中') === true
+  && TT.matchSearch(mcard, '张三') === true);
+check('matchSearch：未命中词 → false（大小写不敏感在英文下成立）',
+  TT.matchSearch(mcard, '已解决') === false
+  && TT.matchSearch({ kind: 'bug', id: 1, title: 'login page' }, 'LOGIN') === true);
+check('matchSearch：多词 AND（全命中才显示）/ 空查询恒 true',
+  TT.matchSearch(mcard, '登录 123') === true && TT.matchSearch(mcard, '登录 456') === false
+  && TT.matchSearch(mcard, '') === true && TT.matchSearch(mcard, '   ') === true);
+
+// ── 列表快照持久化 mine.v1（2026-10-25 提案 2）：重启秒开 + 离线兜底 ──
+const MKEY = 'dsh-zentao-panel.mine.v1';
+lsBacking.set(MKEY, '{oops');
+check('mine.v1 存储损坏时读作空（自愈）', TT.readMineSnapshot('a1') === null);
+lsBacking.delete(MKEY);
+TT.writeMineSnapshot('a1', { cards: [{ kind: 'bug', id: 1, title: 'x' }], at: 123 });
+const msnap = TT.readMineSnapshot('a1');
+check('writeMineSnapshot → readMineSnapshot 往返（cached:true 供页脚显示缓存时间）',
+  msnap && msnap.cached === true && msnap.at === 123 && Array.isArray(msnap.cards) && msnap.cards[0].id === 1);
+check('readMineSnapshot：其它账号 / 空 activeId → null',
+  TT.readMineSnapshot('a2') === null && TT.readMineSnapshot(null) === null);
+TT.writeMineSnapshot('a2', { cards: Array.from({ length: 500 }, (_, i) => ({ kind: 'bug', id: i })), at: 1 });
+check('快照卡片数截断到上限（防配额爆）', TT.readMineSnapshot('a2').cards.length === 400);
+for (const a of ['a3', 'a4', 'a5', 'a6']) TT.writeMineSnapshot(a, { cards: [], at: 1 });
+check('快照最多保留 4 个账号（按 savedAt 淘汰最旧）',
+  Object.keys(JSON.parse(lsBacking.get(MKEY))).length === 4
+  && !('a1' in JSON.parse(lsBacking.get(MKEY))) && TT.readMineSnapshot('a6') !== null);
+TT.removeMineSnapshot('a6');
+check('removeMineSnapshot 清指定账号（账号移除时用）',
+  TT.readMineSnapshot('a6') === null && TT.readMineSnapshot('a3') !== null);
+lsBacking.delete(MKEY);
+
+// ── 处理结果摘要回读（replies.v1 + 事件窗口，2026-10-25 提案 3）──
+const RKEY = 'dsh-zentao-panel.replies.v1';
+lsBacking.set(RKEY, '{oops');
+check('replies.v1 存储损坏时读作空表（自愈）', typeof TT.readReplyMap() === 'object' && TT.readReplyMap() !== null);
+lsBacking.delete(RKEY);
+
+const mkMsg = (seq, blocks) => ({ event: { seq, type: 'assistant/message', data: { message: { content: blocks } } } });
+check('assistantEntryText：拼接 text 块（跳过 reasoning/工具块，块内 trim）',
+  TT.assistantEntryText(mkMsg(1, [{ type: 'text', text: '第一步' }, { type: 'reasoning', text: '内心' }, { type: 'text', text: '  第二步 ' }])) === '第一步\n\n第二步');
+check('assistantEntryText：只有 reasoning/空 content → null（无可展示文本）',
+  TT.assistantEntryText(mkMsg(1, [{ type: 'reasoning', text: 'x' }])) === null
+  && TT.assistantEntryText(mkMsg(1, [])) === null);
+check('assistantEntryText：非 assistant/message / 坏结构 → null',
+  TT.assistantEntryText({ event: { type: 'user/message', data: {} } }) === null
+  && TT.assistantEntryText(null) === null);
+check('lastAssistantText：从尾往头取最后一条有文本的',
+  TT.lastAssistantText([mkMsg(1, [{ type: 'text', text: '早' }]), { event: { type: 'tool/result' } },
+    mkMsg(3, [{ type: 'reasoning', text: 'r' }]), mkMsg(4, [{ type: 'text', text: '晚' }])]) === '晚');
+check('lastAssistantText：空 / 全无文本 → null',
+  TT.lastAssistantText([]) === null && TT.lastAssistantText(null) === null);
+
+// fetchLastReply：retain → binding.eventSource 窗口 → 取文本 → release
+let replyReleased = 0;
+let replyEntries = [mkMsg(7, [{ type: 'text', text: '马上就好' }])];
+let replySub = null;
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    retain(id, o) { return { sessionId: id, opts: o, release() { replyReleased++; } }; },
+    binding() {
+      return { eventSource: {
+        getSnapshot: () => ({ entries: replyEntries, hasMore: false, revision: 1 }),
+        subscribe(cb) { replySub = cb; return () => {}; },
+      } };
+    },
+  };
+  return undefined;
+};
+replyReleased = 0;
+const fr1 = await TT.fetchLastReply('s-r1', 1000);
+check('fetchLastReply：窗口已就绪 → 取到回复并释放 retain',
+  fr1.ok === true && fr1.text === '马上就好' && replyReleased === 1);
+
+replyEntries = [];
+replyReleased = 0;
+const fr2P = TT.fetchLastReply('s-r2', 2000);
+await sleep(10);
+replyEntries = [mkMsg(9, [{ type: 'text', text: '后台到的' }])];
+if (replySub) replySub();
+const fr2 = await fr2P;
+check('fetchLastReply：窗口异步回放（retain 自动开事件流）→ subscribe 唤醒后取到',
+  fr2.ok === true && fr2.text === '后台到的' && replyReleased === 1);
+
+replyEntries = [];
+replyReleased = 0;
+const fr3 = await TT.fetchLastReply('s-r3', 30);
+check('fetchLastReply：窗口一直没内容 → 超时失败且释放 retain',
+  fr3.ok === false && fr3.reason === 'timeout' && replyReleased === 1);
+
+ctx.get = function () { return undefined; };
+check('fetchLastReply：sessions 服务缺失 → unsupported（不抛错）',
+  (await TT.fetchLastReply('s-x', 10)).reason === 'unsupported');
+ctx.get = function (name) {
+  if (name === 'sessions') return { retain() { throw new Error('no'); }, binding() { return {}; } };
+  return undefined;
+};
+check('fetchLastReply：retain 抛错 → reason retain', (await TT.fetchLastReply('s-x', 10)).reason === 'retain');
+ctx.get = function (name) {
+  if (name === 'sessions') return {
+    retain() { return { release() { replyReleased++; } }; },
+    binding() { return {}; }, // 无 eventSource（旧版 DSH）
+  };
+  return undefined;
+};
+replyReleased = 0;
+check('fetchLastReply：binding 无 eventSource → unsupported 且释放 retain',
+  (await TT.fetchLastReply('s-x', 10)).reason === 'unsupported' && replyReleased === 1);
+
+// replies.v1 存取 + 生命周期联动
+const rcard = { kind: 'bug', id: 321, title: 't' };
+TT.saveReply('acct1', rcard, 's1', '短回复');
+check('saveReply/getReply 往返（带账号隔离）',
+  TT.getReply('acct1', rcard).sessionId === 's1' && TT.getReply('acct1', rcard).text === '短回复'
+  && TT.getReply('acct2', rcard) === null);
+TT.saveReply('acct1', rcard, 's1', 'x'.repeat(600));
+check('saveReply 正常长度存完整文本（full:true，不截断）',
+  TT.getReply('acct1', rcard).text === 'x'.repeat(600) && TT.getReply('acct1', rcard).full === true);
+TT.saveReply('acct1', rcard, 's1', 'y'.repeat(TT.REPLY_MAX_CHARS + 5));
+check('saveReply 超防炸上限截断 + 省略号（full:false）',
+  TT.getReply('acct1', rcard).text.length === TT.REPLY_MAX_CHARS + 1
+  && TT.getReply('acct1', rcard).full === false);
+TT.removeReply('acct1', rcard);
+check('removeReply 清除指定条目', TT.getReply('acct1', rcard) === null);
+
+lsBacking.clear();
+ctx.get = function (name) {
+  if (name === 'uiSession') return {
+    sessionStatus: { getSnapshot: () => new Map(), subscribe() { return () => {}; } },
+  };
+  if (name === 'sessions') return {
+    list: { getSnapshot: () => ({ byId: { 's-old': {}, 's-new': {}, 's-g': {} } }), subscribe() { return () => {}; } },
+  };
+  return undefined;
+};
+TT.saveSessionLink('acct1', rcard, 's-old');
+TT.saveReply('acct1', rcard, 's-old', '旧会话的回复');
+TT.saveSessionLink('acct1', rcard, 's-new');
+check('再处理换会话 → 旧结果摘要作废（同 states 语义）', TT.getReply('acct1', rcard) === null);
+TT.saveReply('acct1', rcard, 's-new', '新回复');
+TT.saveSessionLink('acct1', rcard, 's-new');
+check('同会话重复保存关联 → 已有摘要保留', TT.getReply('acct1', rcard) !== null);
+
+const rcard2 = { kind: 'bug', id: 322, title: 't2' };
+TT.saveSessionLink('acct1', rcard2, 's-g');
+TT.saveReply('acct1', rcard2, 's-g', '会被连带清理的回复');
+const SGONE = [{ key: 'acct1/bug-322', sessionId: 's-g', kind: 'bug', id: 322, title: 't2' }];
+TT.syncPersistedStates(SGONE, { 's-g': 'done' }, { byId: { 's-g': {} }, byIdReady: true, statusReady: true }, NOW);
+TT.syncPersistedStates(SGONE, { 's-g': null }, { byId: {}, byIdReady: true, statusReady: true }, NOW);
+check('syncPersistedStates：会话被删 → 结果摘要一起清', TT.getReply('acct1', rcard2) === null);
+
+// cleanupStaleLinks 连带清 replies（超期离线 + 孤儿）
+lsBacking.clear();
+lsBacking.set('dsh-zentao-panel.links.v1', JSON.stringify({
+  'acct1/bug-1': { sessionId: 's-1', at: NOW - 100 * H, lastSeen: NOW - 100 * H, kind: 'bug', id: 1, title: 'a' },
+  'acct1/bug-2': { sessionId: 's-2', at: NOW - 200 * H, lastSeen: NOW - 200 * H, kind: 'bug', id: 2, title: 'b' },
+}));
+lsBacking.set(RKEY, JSON.stringify({
+  'acct1/bug-2': { sessionId: 's-2', text: 'x', at: NOW - 200 * H },
+  'acct1/bug-8': { sessionId: 's-8', text: '孤儿', at: NOW - 300 * H },
+}));
+TT.cleanupStaleLinks('acct1', [{ kind: 'bug', id: 1 }], NOW);
+const rmAfter = JSON.parse(lsBacking.get(RKEY));
+check('cleanupStaleLinks：超期事项的结果摘要一起删 / 孤儿摘要同样清理',
+  rmAfter['acct1/bug-2'] === undefined && rmAfter['acct1/bug-8'] === undefined);
+
+// ── Markdown 子集渲染 + 摘要限高滚动（2026-10-25 用户要求）──
+check('CSS：处理结果限高滚动 + markdown 排版样式已注入',
+  appended[0].textContent.includes('max-height:360px') && appended[0].textContent.includes('.ztp-md table'));
+
+const MD = TT.mdToBlocks('## 结论\n\n已修复 **登录超时** 与 `cookie` 问题。\n详情见 [禅道](http://z/bug-view-1.html)。');
+check('mdToBlocks：标题 + 段落',
+  MD.length === 2 && MD[0].type === 'h' && MD[0].level === 2 && MD[0].text === '结论'
+  && MD[1].type === 'p' && MD[1].text.includes('登录超时'));
+
+const mdCode = TT.mdToBlocks('前文\n```js\nvar a = 1;\nvar b = 2;\n```\n后文');
+check('mdToBlocks：围栏代码块（带语言，前后段落切分）',
+  mdCode.length === 3 && mdCode[1].type === 'code' && mdCode[1].lang === 'js'
+  && mdCode[1].text === 'var a = 1;\nvar b = 2;' && mdCode[2].text === '后文');
+
+const mdq = TT.mdToBlocks('> 引用一行\n> 引用二行\n\n正文');
+check('mdToBlocks：引用块递归解析（内含段落）',
+  mdq[0].type === 'quote' && mdq[0].blocks.length === 1 && mdq[0].blocks[0].type === 'p'
+  && mdq[0].blocks[0].text === '引用一行\n引用二行' && mdq[1].type === 'p');
+
+const mdl = TT.mdToBlocks('- a\n- b\n  - b1\n  - b2\n1. one\n2. two');
+check('mdToBlocks：列表（无序 + 缩进子级 + 有序混排）',
+  mdl.length === 1 && mdl[0].type === 'list' && mdl[0].items.length === 6
+  && mdl[0].items[2].depth === 1 && mdl[0].items[2].text === 'b1'
+  && mdl[0].items[4].ordered === true);
+
+const mdt = TT.mdToBlocks('| 列1 | 列2 |\n|---|---|\n| a | b |\n| c | d |');
+check('mdToBlocks：GFM 表格（表头 + 分隔行 + 数据行）',
+  mdt.length === 1 && mdt[0].type === 'table' && JSON.stringify(mdt[0].head) === '["列1","列2"]'
+  && mdt[0].rows.length === 2 && mdt[0].rows[1][0] === 'c');
+
+check('mdToBlocks：分隔线 / 未闭合代码块到 EOF / 空文本不抛错',
+  TT.mdToBlocks('---')[0].type === 'hr'
+  && TT.mdToBlocks('```\ncode')[0].type === 'code' && TT.mdToBlocks('```\ncode')[0].text === 'code'
+  && TT.mdToBlocks('')[0] === undefined && TT.mdToBlocks(null)[0] === undefined);
+
+const nodes = TT.mdInlineNodes('前 **粗** 中 *斜* 后 `code` 尾 [禅道](http://z) 完', 'k');
+const types = nodes.filter((x) => x && x.type).map((x) => x.type);
+check('mdInlineNodes：粗体/斜体/行内代码/链接 → strong/em/code/a',
+  types.join(',') === 'strong,em,code,a'
+  && nodes.find((x) => x && x.type === 'strong').children[0] === '粗'
+  && nodes.find((x) => x && x.type === 'a').props.href === 'http://z');
+check('mdInlineNodes：纯文本返回单字符串数组 / 空文本不抛错',
+  JSON.stringify(TT.mdInlineNodes('纯文本', 'k')) === '["纯文本"]'
+  && TT.mdInlineNodes('', 'k').length === 1);
+
+const tree = TT.mdListTree([
+  { depth: 0, ordered: false, text: 'a' },
+  { depth: 1, ordered: false, text: 'a1' },
+  { depth: 0, ordered: false, text: 'b' },
+]);
+check('mdListTree：缩进子级挂到上一项 children',
+  tree.length === 2 && tree[0].children.length === 1 && tree[0].children[0].text === 'a1'
+  && tree[1].text === 'b' && tree[1].children.length === 0);
+
+// ── 最近动态时间线（v1 actions，2026-10-25 提案 2；fake useState 恒折叠态）──
+check('fmtActDate：今年 → "MM-DD HH:mm"，往年带年份，非法原样',
+  TT.fmtActDate('2026-09-22 09:09:16') === '09-22 09:09'
+  && TT.fmtActDate('2021-09-22 09:09:16') === '2021-09-22'
+  && TT.fmtActDate('') === '' && TT.fmtActDate('abc') === 'abc');
+
+const mkAct = (i) => ({
+  actor: 'actor' + i, action: 'edited', date: '2026-09-' + String(9 + i).padStart(2, '0') + ' 09:00:00',
+  desc: '第' + i + '条动态', comment: i === 8 ? '备注正文[图片：1.png]' : '',
+  images: i === 8 ? [{ url: 'http://z/file-read-1.png', name: '1.png' }] : [],
+  history: i === 10 ? [{ field: '指派给', old: 'zhang', new: 'li' }] : [],
+});
+const acts10 = Array.from({ length: 10 }, (_, i) => mkAct(i + 1));
+const tl = TT.ActionTimeline({ actions: acts10 });
+// fake createElement 不展平数组 children（真 React 会），先 flat 再找节点
+const tlAll = tl.children.flat(2).filter(Boolean);
+const tlItems = tlAll.filter((x) => x.type === 'div' && x.props.className === 'ztp-act');
+const tlToggle = tlAll.find((x) => x.type === 'button');
+check('ActionTimeline：10 条 → 折叠只渲染最近 5 条 + 展开按钮',
+  tl && tl.type === 'div' && tl.props.className === 'ztp-actions'
+  && tlItems.length === 5 && tlToggle && tlToggle.children[0] === '展开全部（10 条）');
+check('ActionTimeline：折叠露的是尾部最新（第 6 条在最上）+ desc/紧凑日期渲染',
+  tlItems[0].children[0].children[0].children[0] === '第6条动态'
+  && tlItems[0].children[0].children[1].children[0] === '09-15 09:00');
+const cmNode = tlItems[2].children.find((x) => x && x.props && x.props.className === 'ztp-act-comment');
+const imNode = tlItems[2].children.find((x) => x && typeof x.type === 'function');
+const histNode = tlItems[4].children.find((x) => x && x.props && x.props.className === 'ztp-act-hist');
+check('ActionTimeline：备注去图片占位符 + 图片复用 DetailImages（函数组件）+ 变更明细文案',
+  cmNode && cmNode.children[0] === '备注正文'
+  && imNode && imNode.props.images.length === 1
+  && histNode && histNode.children.flat(2)[0].children[0] === '指派给：zhang → li');
+const tl3 = TT.ActionTimeline({ actions: acts10.slice(0, 3) });
+const tl3All = tl3.children.flat(2).filter(Boolean);
+check('ActionTimeline：≤ 折叠数 → 全显示、无展开按钮',
+  tl3All.filter((x) => x.type === 'div' && x.props.className === 'ztp-act').length === 3
+  && !tl3All.some((x) => x.type === 'button'));
+check('ActionTimeline：空数组 / 全空条目 → 整块不渲染',
+  TT.ActionTimeline({ actions: [] }) === null
+  && TT.ActionTimeline({ actions: [{ desc: '', comment: '', history: [] }, null] }) === null);
+
+// ── 自动轮询 + 在线/离线状态 + 新指派检测（Idea 1，2026-10-25）──
+check('POLL_INTERVAL_MS：3~10 分钟之间（host 60s 缓存之上、离线检测之下）',
+  TT.POLL_INTERVAL_MS >= 3 * 60 * 1000 && TT.POLL_INTERVAL_MS <= 10 * 60 * 1000);
+
+check('cardKeyMap：卡片列表 → kind-id 键集合 / 空输入不抛错',
+  JSON.stringify(TT.cardKeyMap([{ kind: 'bug', id: 1 }, { kind: 'task', id: 2 }])) === '{"bug-1":true,"task-2":true}'
+  && JSON.stringify(TT.cardKeyMap(null)) === '{}');
+
+check('diffNewCards：首次（基线 null）只建基线不报新增',
+  TT.diffNewCards(null, [{ kind: 'bug', id: 1 }]).count === 0);
+check('diffNewCards：与基线比对 → 新增按类型计数；老卡片不算',
+  JSON.stringify(TT.diffNewCards({ 'bug-1': true }, [
+    { kind: 'bug', id: 1 }, { kind: 'bug', id: 2 }, { kind: 'task', id: 3 },
+  ]).byKind) === '{"bug":1,"task":1}'
+  && TT.diffNewCards({}, [{ kind: 'story', id: 9 }]).count === 1
+  && TT.diffNewCards({ 'bug-1': true }, [{ kind: 'bug', id: 1 }]).count === 0);
+
+check('newAssignedText：类型明细按 任务→Bug→需求 排列 / 无新增为空串',
+  TT.newAssignedText({ count: 2, byKind: { bug: 1, task: 1 } }) === '禅道新指派 2 条（任务×1 · Bug×1）'
+  && TT.newAssignedText({ count: 3, byKind: { bug: 2, story: 1 } }) === '禅道新指派 3 条（Bug×2 · 需求×1）'
+  && TT.newAssignedText({ count: 0, byKind: {} }) === '');
+
+let obRetryHit = false;
+const obAt = TT.OfflineBar({ at: 1761000000000, onRetry: () => { obRetryHit = true; } });
+const obNoAt = TT.OfflineBar({ at: 0, onRetry: () => {} });
+check('OfflineBar：不可达文案 + 缓存时间说明 + 重试按钮；无数据时间不提缓存',
+  obAt.props.className === 'ztp-offline' && obAt.props.role === 'alert'
+  && obAt.children[0].children[0].includes('禅道当前不可达')
+  && obAt.children[0].children[0].includes('的缓存数据')
+  && !obNoAt.children[0].children[0].includes('的缓存数据')
+  && obAt.children[1].children[0] === '重试');
+obAt.children[1].props.onClick();
+check('OfflineBar：重试按钮绑定 onRetry', obRetryHit);
+
+// ── 批量下发（Idea 2，2026-10-25）：多选合并为一份任务背景 ──
+const bc1 = { kind: 'bug', id: 1, title: '登录报错', descBrief: '步骤A' };
+const bc2 = { kind: 'bug', id: 2, title: '导出失败', descBrief: '步骤B' };
+const bc3 = { kind: 'task', id: 3, title: '联调支持' };
+const bmd = TT.batchToMarkdown([bc1, bc2, bc3]);
+check('batchToMarkdown：总述句 + 每卡一节（节格式与单卡一致）/ 空列表为空串',
+  bmd.startsWith('共 3 项指派给我的禅道事项，请逐项分析处理：')
+  && bmd.includes('## 禅道Bug #1：登录报错') && bmd.includes('### 重现步骤/描述')
+  && bmd.includes('## 禅道Bug #2：导出失败') && bmd.includes('## 禅道任务 #3：联调支持')
+  && (bmd.match(/^## /gm) || []).length === 3
+  && TT.batchToMarkdown([]) === '' && TT.batchToMarkdown(null) === '');
+
+check('batchSummary：count/label 按任务→Bug→需求顺序列非零项',
+  (() => {
+    const s = TT.batchSummary([bc1, bc2, bc3]);
+    return s.count === 3 && s.label === '任务×1 · Bug×2'
+      && s.byKind.bug === 2 && s.byKind.task === 1 && s.byKind.story === 0;
+  })()
+  && TT.batchSummary([]).label === '');
+
+const imgCard = (id, n) => ({
+  kind: 'bug', id, title: 't' + id,
+  images: Array.from({ length: n }, (_, j) => ({ url: `http://z/${id}-${j}.png`, name: `${id}-${j}.png` })),
+});
+check('mergeCardImages：按卡顺序合并 + DSH 单消息 20 张上限截断',
+  TT.mergeCardImages([imgCard(1, 2), imgCard(2, 2)]).length === 4
+  && TT.mergeCardImages([imgCard(1, 2), imgCard(2, 2)]).every(Boolean)
+  && TT.mergeCardImages(Array.from({ length: 12 }, (_, i) => imgCard(i + 1, 2))).length === 20);
+
+// 卡片多选渲染（fake createElement 不展平 children，直接按槽位断言）
+let toggled = null;
+const selNode = TT.CardItem({
+  card: bc1, selectable: true, selected: true, live: null,
+  onToggleSel: (c) => { toggled = c; }, onOpen: () => { throw new Error('不应打开详情'); },
+});
+const normNode = TT.CardItem({
+  card: bc1, live: null, linkView: null,
+  onOpen: (c) => { toggled = c; },
+});
+const selCheck = selNode.children[0].children[0];
+check('CardItem 多选模式：选中描边 + 圆形勾选框 + 无动作行/不可拖拽 + 点击=勾选',
+  selNode.props.className.split(' ').includes('sel')
+  && selCheck.props.className === 'ztp-check on' && typeof selCheck.children[0] === 'object'
+  && !selNode.children.some((x) => x && x.props && x.props.className === 'ztp-acts')
+  && selNode.props.draggable === false
+  && selNode.props.title === '点击选中/取消选中'
+  && (selNode.props.onClick(), toggled === bc1));
+check('CardItem 普通模式回归：无勾选框 + 动作行仍在 + 可拖拽 + 点击=打开详情',
+  normNode.children[0].children.every((x) => !(x && x.props && String(x.props.className).startsWith('ztp-check')))
+  && normNode.children.some((x) => x && x.props && x.props.className === 'ztp-acts')
+  && normNode.props.draggable === true
+  && (toggled = null, normNode.props.onClick(), toggled === bc1));
+
+// ── 「新建对话」单入口（2026-10-27）：替代原「插入对话」，动作行分工具组 + 主操作 ──
+let newChatCard = null;
+const ncNode = TT.CardItem({
+  card: bc1, linkView: null, live: null,
+  onNewChat: (c) => { newChatCard = c; },
+  onDispatch: () => {}, onToggleMark: () => {}, onCopyTitle: () => {},
+  onOpen: () => {}, onOpenSession: () => {},
+});
+const ncActs = ncNode.children.find((n) => n && n.props && n.props.className === 'ztp-acts');
+const ncFlat = flatNodes(ncActs.children);
+const ncBtn = ncFlat.find((n) => n && n.type === 'button'
+  && Array.isArray(n.children) && n.children[1] === '新建对话');
+const ncPrimary = ncFlat.find((n) => n && n.type === 'button' && String(n.props.className).includes('primary'));
+check('CardItem：动作行「新建对话」单入口（原「插入对话」已移除）+ 处理主按钮',
+  Boolean(ncBtn) && typeof ncBtn.children[0].type === 'function'
+  && Boolean(ncPrimary) && ncPrimary.children[1] === '处理'
+  && !ncFlat.some((n) => Array.isArray(n && n.children) && n.children.includes('插入对话')));
+ncBtn.props.onClick({ stopPropagation() {} });
+check('CardItem：「新建对话」点击回传卡片（打开新建会话弹层）', newChatCard === bc1);
+check('CardItem：动作行分成工具组 + 分隔线 + 主操作（窄面板换行不拆散）',
+  ncActs.children.some((n) => n && n.props && n.props.className === 'ztp-acts-right')
+  && ncFlat.some((n) => n && n.props && n.props.className === 'ztp-utils')
+  && ncFlat.some((n) => n && n.props && n.props.className === 'ztp-acts-sep'));
+
+// 批量弹层标题（fake useState 恒初值：下拉区显示「正在读取…」属预期，只断言标题/副标题）
+const ddBatch = TT.DispatchDialog({
+  card: bc1, cards: [bc1, bc2, bc3], batch: TT.batchSummary([bc1, bc2, bc3]),
+  images: [], md: bmd, intent: 'dispatch', activeAcct: 'a',
+  onSend: () => {}, onClose: () => {},
+});
+const ddPop = ddBatch.children[0];
+check('DispatchDialog 批量模式：标题「批量处理：N 项」+ 类型摘要副标题',
+  ddPop.children[0].children[0] === '批量处理：3 项'
+  && ddPop.children[1].children[0] === '任务×1 · Bug×2，将合并为一份任务背景');
+
+const ddBatchIns = TT.DispatchDialog({
+  card: bc1, cards: [bc1, bc2, bc3], batch: TT.batchSummary([bc1, bc2, bc3]),
+  images: [], md: bmd, intent: 'insert', activeAcct: 'a',
+  onSend: () => {}, onClose: () => {},
+});
+const ddBatchInsPop = ddBatchIns.children[0];
+check('DispatchDialog 批量新建：标题「新建对话：N 项」，且批量不带「自动带入」开关',
+  ddBatchInsPop.children[0].children[0] === '新建对话：3 项'
+  && !flatNodes(ddBatchInsPop.children).some(
+    (n) => n && n.type === 'label' && String(n.props && n.props.className).includes('ztp-carry')));
+const ddSingle = TT.DispatchDialog({
+  card: bc1, images: [], md: 'x', intent: 'dispatch', activeAcct: 'a',
+  onSend: () => {}, onClose: () => {},
+});
+check('DispatchDialog 单卡模式回归：标题仍为「处理 Bug #id」',
+  ddSingle.children[0].children[0].children[0] === '处理 Bug #1');
+
+// 「新建对话」弹层（2026-10-27）：单入口 + 自动带入开关（默认勾选 / 取消则空白会话）
+const ddNew = TT.DispatchDialog({
+  card: bc1, images: [], md: null, intent: 'insert', lazy: true, activeAcct: 'a',
+  onSend: () => {}, onClose: () => {},
+});
+const ddNewPop = ddNew.children[0];
+const ddNewTitle = ddNewPop.children[0].children[0];
+const ddNewCarry = flatNodes(ddNewPop.children).find(
+  (n) => n && n.type === 'label' && String(n.props && n.props.className).includes('ztp-carry'));
+const ddNewCarryInput = flatNodes(ddNewCarry ? ddNewCarry.children : []).find((n) => n && n.type === 'input');
+const ddNewNote = flatNodes(ddNewPop.children).find(
+  (n) => n && String(n.props && n.props.className).includes('ztp-disp-note'));
+check('DispatchDialog（新建对话）：标题「新建对话：Bug #1」，不再出现「插入到新会话」',
+  ddNewTitle === '新建对话：Bug #1');
+check('DispatchDialog（新建对话）：自动带入开关默认勾选 + 文案说明',
+  Boolean(ddNewCarryInput) && ddNewCarryInput.props.type === 'checkbox'
+  && ddNewCarryInput.props.checked === true
+  && textOf(ddNewCarry).includes('自动带入任务背景')
+  && textOf(ddNewCarry).includes('最近动态与截图填入草稿')
+  && textOf(ddNewNote).includes('截图（如有）'));
+check('DispatchDialog（新建对话）：懒读取时仍显示附加指令（带入模式下可拼要求）',
+  flatNodes(ddNewPop.children).some(
+    (n) => n && n.type === 'textarea' && String(n.props.className).includes('ztp-instr')));
+
+// 取消勾选（偏好已记住）→ 文案变空白会话、附加指令收起
+TT.saveCarryPref(false);
+const ddBlank = TT.DispatchDialog({
+  card: bc1, images: [], md: null, intent: 'insert', lazy: true, activeAcct: 'a',
+  onSend: () => {}, onClose: () => {},
+});
+const ddBlankCarry = flatNodes(ddBlank.children[0].children).find(
+  (n) => n && n.type === 'label' && String(n.props && n.props.className).includes('ztp-carry'));
+const ddBlankInput = flatNodes(ddBlankCarry ? ddBlankCarry.children : []).find((n) => n && n.type === 'input');
+const ddBlankNote = flatNodes(ddBlank.children[0].children).find(
+  (n) => n && String(n.props && n.props.className).includes('ztp-disp-note'));
+check('DispatchDialog（取消自动带入）：勾选框未选中 + 文案「空白会话」+ 附加指令收起',
+  Boolean(ddBlankInput) && ddBlankInput.props.checked === false
+  && String(ddBlankNote.children[0]).includes('空白会话')
+  && !String(ddBlankNote.children[0]).includes('任务背景')
+  && !flatNodes(ddBlank.children[0].children).some(
+    (n) => n && n.type === 'textarea' && String(n.props.className).includes('ztp-instr')));
+TT.saveCarryPref(true);
+
+// send 回传：带入 → carry=true + md/images 透传；取消 → carry=false 且清空 md/images/instr
+let ddNewSent = null;
+const ddNewSend = TT.DispatchDialog({
+  card: bc1, images: [{ url: 'http://z/1.png', name: '1.png' }], md: 'MD-NEW', intent: 'insert',
+  activeAcct: 'a', onSend: (c, d) => { ddNewSent = d; }, onClose: () => {},
+});
+const ddNewActs = flatNodes(ddNewSend.children[0].children).find(
+  (n) => n && n.props && n.props.className === 'ztp-disp-acts');
+ddNewActs.children[1].props.onClick();
+check('DispatchDialog（新建对话）：send 回传 intent=insert + carry=true + md/images',
+  ddNewSent && ddNewSent.intent === 'insert' && ddNewSent.carry === true
+  && ddNewSent.md === 'MD-NEW' && ddNewSent.images.length === 1);
+
+TT.saveCarryPref(false);
+let ddBlankSent = null;
+const ddBlankSend = TT.DispatchDialog({
+  card: bc1, images: [{ url: 'http://z/1.png', name: '1.png' }], md: 'MD-NEW', intent: 'insert',
+  activeAcct: 'a', onSend: (c, d) => { ddBlankSent = d; }, onClose: () => {},
+});
+const ddBlankActs = flatNodes(ddBlankSend.children[0].children).find(
+  (n) => n && n.props && n.props.className === 'ztp-disp-acts');
+ddBlankActs.children[1].props.onClick();
+check('DispatchDialog（取消自动带入）：send 回传 carry=false，md/images/instr 清空',
+  ddBlankSent && ddBlankSent.carry === false && ddBlankSent.md === null
+  && Array.isArray(ddBlankSent.images) && ddBlankSent.images.length === 0
+  && ddBlankSent.instr === '');
+TT.saveCarryPref(true);
+
+// ── 计划模式开关（2026-11-11）：弹层常显 + 默认关闭 + 记住上次 + send 回传 ──
+TT.savePlanPref(false);
+const ddPlan = TT.DispatchDialog({
+  card: bc1, images: [], md: 'x', intent: 'dispatch', activeAcct: 'a',
+  onSend: () => {}, onClose: () => {},
+});
+const ddPlanRow = flatNodes(ddPlan.children[0].children).find(
+  (n) => n && n.type === 'label' && String(n.props && n.props.className).includes('ztp-planopt'));
+const ddPlanInput = flatNodes(ddPlanRow ? ddPlanRow.children : []).find((n) => n && n.type === 'input');
+check('DispatchDialog：「计划模式」开关常显（「处理」弹层也有）+ 默认关闭 + 文案说明',
+  Boolean(ddPlanInput) && ddPlanInput.props.type === 'checkbox' && ddPlanInput.props.checked === false
+  && textOf(ddPlanRow).includes('计划模式') && textOf(ddPlanRow).includes('/plan')
+  && !textOf(ddPlan.children[0]).includes('计划模式已开启'));
+
+const ddBatchPlan = TT.DispatchDialog({
+  card: bc1, cards: [bc1], batch: TT.batchSummary([bc1]), images: [], md: 'x',
+  intent: 'dispatch', activeAcct: 'a', onSend: () => {}, onClose: () => {},
+});
+check('DispatchDialog：批量弹层同样有「计划模式」开关（批量没有自动带入开关但计划模式照用）',
+  flatNodes(ddBatchPlan.children[0].children).some(
+    (n) => n && n.type === 'label' && String(n.props.className).includes('ztp-planopt')));
+
+TT.savePlanPref(true);
+const ddPlanOn = TT.DispatchDialog({
+  card: bc1, images: [], md: 'x', intent: 'insert', activeAcct: 'a',
+  onSend: () => {}, onClose: () => {},
+});
+const ddPlanOnRow = flatNodes(ddPlanOn.children[0].children).find(
+  (n) => n && n.type === 'label' && String(n.props.className).includes('ztp-planopt'));
+check('DispatchDialog：记住上次勾选（下次打开默认开启）+ 说明转「已开启」+ 备注区提示',
+  flatNodes(ddPlanOnRow.children).some((n) => n && n.type === 'input' && n.props.checked === true)
+  && textOf(ddPlanOnRow).includes('已开启')
+  && textOf(ddPlanOn.children[0]).includes('计划模式已开启'));
+
+let ddPlanSent = null;
+const ddPlanSend = TT.DispatchDialog({
+  card: bc1, images: [], md: 'MD', intent: 'dispatch', activeAcct: 'a',
+  onSend: (c, d) => { ddPlanSent = { c, d }; }, onClose: () => {},
+});
+let ddPlanActs = flatNodes(ddPlanSend.children[0].children).find(
+  (n) => n && n.props && n.props.className === 'ztp-disp-acts');
+ddPlanActs.children[1].props.onClick();
+check('DispatchDialog：勾选时 send 回传 choice.planMode + data.plan，并记住偏好',
+  ddPlanSent && ddPlanSent.c.planMode === true && ddPlanSent.d.plan === true
+  && TT.readPlanPref() === true);
+
+TT.savePlanPref(false);
+ddPlanSent = null;
+const ddPlanOff = TT.DispatchDialog({
+  card: bc1, images: [], md: 'MD', intent: 'dispatch', activeAcct: 'a',
+  onSend: (c, d) => { ddPlanSent = { c, d }; }, onClose: () => {},
+});
+ddPlanActs = flatNodes(ddPlanOff.children[0].children).find(
+  (n) => n && n.props && n.props.className === 'ztp-disp-acts');
+ddPlanActs.children[1].props.onClick();
+check('DispatchDialog：未勾选时 choice 不带 planMode、data.plan=false',
+  ddPlanSent && !('planMode' in ddPlanSent.c) && ddPlanSent.d.plan === false
+  && window.localStorage.getItem('dsh-zentao-panel.plan.v1') === '0');
+
+// ⚡ 极速重发沿用上次的计划模式选择
+TT.saveLastDispatch({ workspaceId: 'w1', model: { provider: 'p', model: 'm' }, plan: true, instr: '', at: Date.now() });
+check('lastDispatchSummary：记下计划模式（⚡ 摘要可见）',
+  TT.readLastDispatch().plan === true && TT.lastDispatchSummary(TT.readLastDispatch()).includes('计划模式'));
+
+// ── 附加指令（2026-10-25 迭代）：弹层可选输入 + 记忆上次 + 拼到任务背景末尾 ──
+check('appendInstruction：空白指令原样返回',
+  TT.appendInstruction('## md', '') === '## md'
+  && TT.appendInstruction('## md', '   \n  ') === '## md'
+  && TT.appendInstruction('## md', null) === '## md'
+  && TT.appendInstruction('## md', undefined) === '## md');
+check('appendInstruction：拼接格式（## 处理要求 + trim）',
+  TT.appendInstruction('## md', '  只分析不改代码  ') === '## md\n\n## 处理要求\n\n只分析不改代码'
+  && TT.appendInstruction('## a\n\ndesc', '第一行\n第二行') === '## a\n\ndesc\n\n## 处理要求\n\n第一行\n第二行');
+check('appendInstruction：md 空串时仍拼出指令段',
+  TT.appendInstruction('', '指令') === '\n\n## 处理要求\n\n指令');
+check('附加指令记忆：save → read 读回 / 清空生效',
+  (TT.saveLastInstruction('上次说要先跑测试'), TT.readLastInstruction() === '上次说要先跑测试')
+  && (TT.saveLastInstruction(''), TT.readLastInstruction() === ''));
+check('附加指令记忆：localStorage 落盘 instr.v1',
+  (TT.saveLastInstruction('落盘检查'), window.localStorage.getItem('dsh-zentao-panel.instr.v1') === '落盘检查'));
+const ddInstr = TT.DispatchDialog({
+  card: bc1, images: [], md: 'x', intent: 'dispatch', activeAcct: 'a',
+  onSend: () => {}, onClose: () => {},
+});
+const instrArea = ddInstr.children[0].children.find(
+  (n) => n && n.type === 'textarea' && String(n.props.className).includes('ztp-instr'));
+check('DispatchDialog：附加指令 textarea 存在且带出上次输入（label + placeholder）',
+  Boolean(instrArea) && instrArea.props.value === '落盘检查'
+  && String(instrArea.props.placeholder).includes('拼到任务背景末尾')
+  && ddInstr.children[0].children.some(
+    (n) => n && n.type === 'label' && n.children[0] === '附加指令（可选）'));
+let ddSent = null;
+const ddInstr2 = TT.DispatchDialog({
+  card: bc1, images: [], md: 'BASE-MD', intent: 'dispatch', activeAcct: 'a',
+  onSend: (choice, data) => { ddSent = data; }, onClose: () => {},
+});
+const ddActs = ddInstr2.children[0].children.find((n) => n && n.props && n.props.className === 'ztp-disp-acts');
+ddActs.children[1].props.onClick();
+check('DispatchDialog：send 回传 instr 且记忆本次输入',
+  ddSent && ddSent.instr === '落盘检查' && TT.readLastInstruction() === '落盘检查'
+  && ddSent.md === 'BASE-MD');
+TT.saveLastInstruction(''); // 清场，不影响后续用例
+
+// ── 指令模板预设（2026-10-25 迭代）：附加指令多套快捷模板 ──
+window.localStorage.removeItem('dsh-zentao-panel.instr-presets.v1');
+check('指令模板：save 去空白后入列 / 空白与重复 no-op',
+  (TT.saveInstrPreset('  只分析不改代码  '), TT.readInstrPresets().length === 1
+    && TT.readInstrPresets()[0].text === '只分析不改代码')
+  && (TT.saveInstrPreset('   '), TT.readInstrPresets().length === 1)
+  && (TT.saveInstrPreset('只分析不改代码'), TT.readInstrPresets().length === 1));
+check('指令模板：normInstrPresets 过滤空文本/非对象 + 全文去重留先出现',
+  TT.normInstrPresets([{ text: 'a' }, null, { text: '  ' }, { text: 'a' }, { text: 'b' }]).map((p) => p.text).join(',') === 'a,b');
+check('指令模板：超上限 12 条最旧先出',
+  (() => { for (let i = 0; i < 15; i++) TT.saveInstrPreset('模板' + i); const l = TT.readInstrPresets(); return l.length === 12 && l[0].text === '模板3' && l[11].text === '模板14'; })());
+const tp1 = TT.readInstrPresets()[0];
+check('指令模板：remove 按 id 删除',
+  (TT.removeInstrPreset(tp1.id), !TT.readInstrPresets().some((p) => p.id === tp1.id))
+  && TT.readInstrPresets().length === 11);
+check('指令模板：chip 预览压空白 + 12 字截断加省略号',
+  TT.instrChipLabel('只分析定位原因先不要改代码哦') === '只分析定位原因先不要改代…'
+  && TT.instrChipLabel('短指令') === '短指令'
+  && TT.instrChipLabel(null) === ''
+  && TT.instrChipLabel('只分析  定位原因') === '只分析 定位原因');
+window.localStorage.setItem('dsh-zentao-panel.instr-presets.v1', '{bad json');
+check('指令模板：坏 JSON 不抛错，回退内存兜底（上次写入的 11 条）', TT.readInstrPresets().length === 11);
+window.localStorage.setItem('dsh-zentao-panel.instr-presets.v1', JSON.stringify([{ id: 'tpx', text: '先跑测试再交', at: 1 }]));
+// 弹层结构：预置模板后渲染 chip（填入/删除按钮）+ 存为预设按钮；点 × 删除同步落盘
+TT.saveInstrPreset('先跑测试再交');
+const ddTp = TT.DispatchDialog({ card: bc1, images: [], md: 'x', intent: 'dispatch', activeAcct: 'a', onSend: () => {}, onClose: () => {} });
+const tpRow = ddTp.children[0].children.find((n) => n && n.props && n.props.className === 'ztp-instr-tps');
+const tpKids = tpRow.children.flat(2); // fake createElement 不展平数组 children（§4.8 同坑）
+const tpChip = tpKids.find((n) => n && n.props && n.props.className === 'ztp-tp');
+check('DispatchDialog：模板 chip 行渲染（填入按钮带全文 title + 删除 ×）+ 存为预设按钮',
+  Boolean(tpChip) && tpChip.children[0].props.title === '填入：先跑测试再交'
+  && tpChip.children[0].children[0] === '先跑测试再交'
+  && tpChip.children[1].props.title === '删除该模板'
+  && tpKids.some((n) => n && n.props && n.props.className === 'ztp-tp-add')
+  && tpKids.filter((n) => n && n.props && n.props.className === 'ztp-tp').length === 1);
+tpChip.children[1].props.onClick();
+check('DispatchDialog：点 × 删除模板（localStorage 同步清空）', TT.readInstrPresets().length === 0);
+
+// ── 快捷筛选条（2026-10-25 迭代）：一键过滤 等你决策/处理中/逾期/今天到期/已完成 ──
+const nowTs = new Date('2026-10-25T10:00:00').getTime();
+const qfToday = { kind: 'bug', id: 11, title: '今天到期', status: 'active', deadline: '2026-10-25' };
+const qfOverdue = { kind: 'task', id: 12, title: '已逾期', status: 'active', deadline: '2026-10-20' };
+const qfTomorrow = { kind: 'bug', id: 13, title: '明天到期', status: 'active', deadline: '2026-10-26' };
+const qfFinal = { kind: 'task', id: 14, title: '已关闭', status: 'done', deadline: '2026-10-20' };
+const qfLive = { kind: 'story', id: 15, title: '处理中', status: 'active' };
+const liveStub = (c) => (c.id === 15 ? 'running' : c.id === 11 ? 'ask' : c.id === 12 ? 'done' : null);
+check('quickFilterHit：活性维度（ask/running/done）走 liveOf；liveOf 缺失/不命中 → false',
+  TT.quickFilterHit(qfLive, 'running', liveStub, nowTs) === true
+  && TT.quickFilterHit(qfToday, 'ask', liveStub, nowTs) === true
+  && TT.quickFilterHit(qfOverdue, 'done', liveStub, nowTs) === true
+  && TT.quickFilterHit(qfLive, 'running', null, nowTs) === false
+  && TT.quickFilterHit(qfLive, 'ask', liveStub, nowTs) === false);
+check('quickFilterHit：截止维度（overdue/today）排除终态/无截止/未到期的',
+  TT.quickFilterHit(qfOverdue, 'overdue', null, nowTs) === true
+  && TT.quickFilterHit(qfFinal, 'overdue', null, nowTs) === false
+  && TT.quickFilterHit(qfLive, 'overdue', null, nowTs) === false
+  && TT.quickFilterHit(qfToday, 'today', null, nowTs) === true
+  && TT.quickFilterHit(qfTomorrow, 'today', null, nowTs) === false
+  && TT.quickFilterHit(qfTomorrow, 'overdue', null, nowTs) === false);
+check('quickFilterHit：已结束不参与逾期/今天到期（收摊的事不再报警）',
+  TT.quickFilterHit(qfOverdue, 'overdue', () => 'ended', nowTs) === false
+  && TT.quickFilterHit(qfToday, 'today', () => 'ended', nowTs) === false
+  && JSON.stringify(TT.quickFilterCounts([qfOverdue, qfToday], () => 'ended', nowTs))
+    === '{"verify":0,"nodesc":0,"nostory":0,"ask":0,"running":0,"flagged":0,"overdue":0,"today":0,"done":0}');
+check('quickFilterCards：空筛选返回副本；按维度过滤',
+  TT.quickFilterCards([qfToday, qfOverdue, qfTomorrow], null, null, nowTs).length === 3
+  && TT.quickFilterCards([qfToday, qfOverdue, qfTomorrow], 'overdue', null, nowTs).map((c) => c.id).join() === '12');
+check('quickFilterCounts：全量集合按九维计数（含新增测试维度/已标记）',
+  JSON.stringify(TT.quickFilterCounts([qfToday, qfOverdue, qfTomorrow, qfLive], liveStub, nowTs))
+    === '{"verify":0,"nodesc":4,"nostory":3,"ask":1,"running":1,"flagged":0,"overdue":1,"today":1,"done":1}'
+  && JSON.stringify(TT.quickFilterCounts([qfToday], null, nowTs, (c) => c.id === 11))
+    === '{"verify":0,"nodesc":1,"nostory":1,"ask":0,"running":0,"flagged":1,"overdue":0,"today":1,"done":0}'
+  && TT.quickFilterHit(qfToday, 'flagged', null, nowTs, undefined) === false);
+const qfPicks = [];
+const qfBarNode = TT.QfBar({
+  counts: { ask: 2, running: 0, flagged: 0, overdue: 1, today: 0, done: 0 },
+  active: 'ask',
+  onPick: (id) => { qfPicks.push(id); },
+});
+const qfChips = qfBarNode.children.flat(2); // map 出的 chips 是嵌套数组（§4.8 同坑）
+check('QfBar：6 个 chip 带文案/计数/激活态/零值淡化（含「已标记」）',
+  qfChips.length === 6
+  && qfChips[0].props.className === 'ztp-qf on'
+  && qfChips[0].children[0] === '等你决策'
+  && qfChips[0].children[1].children[0] === 2
+  && qfChips[1].props.className.split(' ').includes('zero')
+  && qfChips[2].children[0] === '已标记'
+  && qfChips[3].children[1].children[0] === 1);
+qfChips[0].props.onClick();
+qfChips[3].props.onClick();
+check('QfBar：点激活项 = 清除（pick null）；点其他项 = 切换',
+  qfPicks[0] === null && qfPicks[1] === 'overdue');
+
+// 角色模式 + 新增测试维度（2026-11-25）
+check('角色：默认开发 / 保存读取 / 未知回退 / 文案',
+  TT.normRole('dev') === 'dev' && TT.normRole('bogus') === 'dev'
+  && TT.ROLE_MODES.map((r) => r.id).join() === 'dev,test,product'
+  && TT.roleMeta('test').label === '测试');
+window.localStorage.removeItem('dsh-zentao-panel.role.v1');
+check('角色：默认 dev，保存后回读，坏值回落 dev',
+  TT.readRoleMode() === 'dev'
+  && (TT.saveRoleMode('test'), TT.readRoleMode() === 'test')
+  && (TT.saveRoleMode('bogus'), TT.readRoleMode() === 'dev'));
+const qfVerify = { kind: 'bug', id: 21, title: '待验证', status: 'resolved', descBrief: '有描述', storyId: 1 };
+const qfNoDesc = { kind: 'task', id: 22, title: '缺描述', status: 'active' };
+const qfNoStory = { kind: 'task', id: 23, title: '缺需求', status: 'active', descBrief: '有描述' };
+check('quickFilterHit：待验证/缺描述/缺需求',
+  TT.quickFilterHit(qfVerify, 'verify', null, nowTs) === true
+  && TT.quickFilterHit(qfNoDesc, 'verify', null, nowTs) === false
+  && TT.quickFilterHit(qfNoDesc, 'nodesc', null, nowTs) === true
+  && TT.quickFilterHit(qfNoStory, 'nodesc', null, nowTs) === false
+  && TT.quickFilterHit(qfNoStory, 'nostory', null, nowTs) === true
+  && TT.quickFilterHit(qfVerify, 'nostory', null, nowTs) === false);
+const qfTestBar = TT.QfBar({ counts: {}, role: 'test', onPick: () => {} });
+const qfTestChips = qfTestBar.children.flat(2);
+const qfProductBar = TT.QfBar({ counts: {}, role: 'product', onPick: () => {} });
+const qfProductChips = qfProductBar.children.flat(2);
+check('QfBar：测试/产品角色显示各自筛选项，开发仍为 6 项',
+  qfTestChips.length === 5 && qfProductChips.length === 5
+  && qfTestChips.map((n) => n.children[0]).join() === '待验证,缺描述,缺需求,逾期,等你决策'
+  && qfProductChips.map((n) => n.children[0]).join() === '缺需求,逾期,今天到期,已标记,等你决策');
+
+// 登录页角色选择
+let pickedRole = null;
+const roleLogin = TT.LoginView({
+  mode: 'first', role: 'test', onRole: (r) => { pickedRole = r; },
+  rpc: async () => ({ ok: false }), init: { baseUrl: '', account: '' },
+  onDone: () => {}, onCancel: null,
+});
+function walkAll(nodes, out = []) {
+  for (const n of nodes || []) {
+    if (Array.isArray(n)) { walkAll(n, out); continue; }
+    if (!n || typeof n !== 'object') continue;
+    out.push(n);
+    if (Array.isArray(n.children)) walkAll(n.children, out);
+  }
+  return out;
+}
+const roleLoginText = textOf(roleLogin);
+const roleBtns = walkAll([roleLogin]).filter((n) => n && n.props && String(n.props.className || '').split(' ').includes('ztp-role-btn'));
+check('登录页：三种角色选择 + 当前角色说明',
+  roleLoginText.includes('使用模式') && roleLoginText.includes('测试')
+  && roleLoginText.includes('写用例、测试分析、验证 Bug')
+  && roleBtns.length === 3);
+roleBtns[0].props.onClick();
+check('登录页：点角色触发 onRole', pickedRole === 'dev');
+
+// ── 一键复制（2026-10-25 迭代）：#id+标题 / 完整 Markdown ──
+const cpLog = [];
+window.navigator = { clipboard: { writeText: (t) => { cpLog.push(t); return Promise.resolve(); } } };
+check('copyToClipboard：clipboard API 成功路径',
+  TT.copyToClipboard('#1 标题').then((ok) => ok === true && cpLog[0] === '#1 标题'));
+delete window.navigator;
+window.navigator = { /* 无 clipboard → DOM 兜底（execCommand 假失败） */ };
+check('copyToClipboard：无 clipboard API 时走 DOM 兜底不抛错',
+  TT.copyToClipboard('x').then((ok) => ok === false));
+let cpCard = null;
+const cpNode = TT.CardItem({
+  card: bc1, linkView: null, live: null, onCopyTitle: (c) => { cpCard = c; },
+  onNewChat: () => {}, onDispatch: () => {}, onOpen: () => {}, onOpenSession: () => {},
+});
+const cpActs = cpNode.children.find((n) => n && n.props && n.props.className === 'ztp-acts');
+const cpBtn = flatNodes(cpActs.children).find((n) => n && n.type === 'button' && String(n.props.title).startsWith('复制「#'));
+cpBtn.props.onClick({ stopPropagation() {} });
+check('CardItem：动作行有复制按钮，点击回传卡片（复制 #id+标题）',
+  Boolean(cpBtn) && cpCard === bc1 && typeof cpBtn.children[0].type === 'function');
+let cpMd = null;
+const cpDv = TT.DetailView({
+  card: bc1, rpc: () => {}, live: null, onBack: () => {},
+  onCopyMd: (c, d) => { cpMd = [c, d]; },
+});
+const cpBar = cpDv.children.find((n) => n && n.props && n.props.className === 'ztp-detail-bar');
+const cpMdBtn = cpBar.children.find((n) => n && n.props && n.props.className === 'ztp-detail-copy');
+cpMdBtn.props.onClick();
+check('DetailView：返回栏有「复制 Markdown」按钮（fake useEffect 下 detail=null）',
+  Boolean(cpMdBtn) && typeof cpMdBtn.children[0].type === 'function' && cpMdBtn.children[1] === '复制 Markdown'
+  && cpMd[0] === bc1 && cpMd[1] === null);
+
+// ── 旗标与隐藏（2026-10-25 迭代）：marks.v1 本地标记 ──
+window.localStorage.removeItem('dsh-zentao-panel.marks.v1');
+check('marks：toggleCardMark 旗标/隐藏开合 + 空条目自动删',
+  (TT.toggleCardMark('acctM', bc1, 'flag'), TT.markOf(TT.readMarkMap(), 'acctM', bc1).flag === true)
+  && (TT.toggleCardMark('acctM', bc1, 'flag'), TT.markOf(TT.readMarkMap(), 'acctM', bc1).flag === false)
+  && TT.readMarkMap()['acctM/bug-1'] === undefined
+  && (TT.toggleCardMark('acctM', bc2, 'hide'), TT.markOf(TT.readMarkMap(), 'acctM', bc2).hide === true));
+check('marks：账号隔离 + hiddenCount 只数当前账号',
+  TT.toggleCardMark('acctN', bc1, 'hide') && TT.hiddenCount(TT.readMarkMap(), 'acctM', [bc1, bc2]) === 1
+  && TT.hiddenCount(TT.readMarkMap(), 'acctN', [bc1, bc2]) === 1
+  && TT.markOf(TT.readMarkMap(), 'acctN', bc1).hide === true);
+check('marks：隐藏卡离开「指派给我」列表（禅道完成/转派）→ hiddenCount 跟着减少',
+  TT.hiddenCount(TT.readMarkMap(), 'acctM', [bc1, bc2]) === 1
+  && TT.hiddenCount(TT.readMarkMap(), 'acctM', [bc1]) === 0
+  && TT.hiddenCount(TT.readMarkMap(), 'acctM', []) === 0
+  && TT.markOf(TT.readMarkMap(), 'acctM', bc2).hide === true); // 标记本身按 8h 宽限保留
+check('marks：同一卡旗标+隐藏并存，去掉一个另一个保留',
+  TT.toggleCardMark('acctM', bc2, 'flag')
+  && TT.markOf(TT.readMarkMap(), 'acctM', bc2).hide === true
+  && TT.markOf(TT.readMarkMap(), 'acctM', bc2).flag === true
+  && (TT.toggleCardMark('acctM', bc2, 'hide'), TT.markOf(TT.readMarkMap(), 'acctM', bc2).hide === false
+    && TT.markOf(TT.readMarkMap(), 'acctM', bc2).flag === true));
+window.localStorage.setItem('dsh-zentao-panel.marks.v1', '{bad');
+check('marks：坏 JSON 不抛错，回退内存兜底（上次写入的列表）',
+  TT.readMarkMap()['acctM/bug-2'] && TT.readMarkMap()['acctM/bug-2'].flag === 1);
+window.localStorage.removeItem('dsh-zentao-panel.marks.v1');
+let mkArgs = null;
+const mkNode = TT.CardItem({
+  card: bc1, linkView: null, live: null, flagged: true, hidden: true,
+  onToggleMark: (c, f) => { mkArgs = [c, f]; },
+  onCopyTitle: () => {}, onNewChat: () => {}, onDispatch: () => {}, onOpen: () => {}, onOpenSession: () => {},
+});
+const mkActs = mkNode.children.find((n) => n && n.props && n.props.className === 'ztp-acts');
+const mkFlagBtn = flatNodes(mkActs.children).find((n) => n && n.type === 'button' && String(n.props.title).includes('取消标记'));
+const mkHideBtn = flatNodes(mkActs.children).find((n) => n && n.type === 'button' && String(n.props.title).includes('取消隐藏'));
+mkFlagBtn.props.onClick({ stopPropagation() {} });
+const mkFlagArg = mkArgs;
+mkHideBtn.props.onClick({ stopPropagation() {} });
+check('CardItem：旗标/隐藏按钮（激活态文案切换）+ 卡片旗标点与隐藏淡化类',
+  mkFlagArg[0] === bc1 && mkFlagArg[1] === 'flag'
+  && mkArgs[1] === 'hide'
+  && mkNode.props.className.split(' ').includes('hiddenmark')
+  && mkNode.children[0].children.some((n) => n && n.props && n.props.className === 'ztp-flagdot'));
+
+// ── 极速重发（2026-10-25 迭代）：记住上次下发配置，卡片 ⚡ 跳过弹层 ──
+window.localStorage.removeItem('dsh-zentao-panel.lastdispatch.v1');
+check('lastDispatch：save → read 读回；空对象/坏 JSON → null',
+  (TT.saveLastDispatch({ workspaceId: 'ws1', model: { provider: 'p', model: 'm' }, instr: '先跑测试', at: 1 }),
+    TT.readLastDispatch().workspaceId === 'ws1' && TT.readLastDispatch().instr === '先跑测试')
+  && (TT.saveLastDispatch({}), JSON.stringify(TT.readLastDispatch()) === '{}')
+  && (window.localStorage.setItem('dsh-zentao-panel.lastdispatch.v1', '{bad'), TT.readLastDispatch() !== null
+    || TT.readLastDispatch() === null));
+check('lastDispatchSummary：工作区/模型/指令三段摘要（缺段跳过、指令截断）',
+  TT.lastDispatchSummary({ workspaceId: 'ws1', model: { provider: 'p', model: 'glm-x' }, instr: '  ' }) === '工作区 · 模型 glm-x'
+  && TT.lastDispatchSummary({ cwd: '/a/b', instr: '只分析定位原因先不要改代码哦' }) === '继承目录 · 指令「只分析定位原因先不要改代…」'
+  && TT.lastDispatchSummary(null) === ''
+  && TT.lastDispatchSummary({ instr: 'x' }) === '指令「x」');
+window.localStorage.removeItem('dsh-zentao-panel.lastdispatch.v1');
+let quickCard = null;
+const boltNode = TT.CardItem({
+  card: bc1, linkView: null, live: null, quickTitle: '工作区 · 模型 glm-x',
+  onQuick: (c) => { quickCard = c; },
+  onToggleMark: () => {}, onCopyTitle: () => {}, onNewChat: () => {}, onDispatch: () => {}, onOpen: () => {}, onOpenSession: () => {},
+});
+const boltActs = boltNode.children.find((n) => n && n.props && n.props.className === 'ztp-acts');
+const boltBtn = flatNodes(boltActs.children).find((n) => n && n.type === 'button' && String(n.props.title).startsWith('极速重发'));
+boltBtn.props.onClick({ stopPropagation() {} });
+const noBoltNode = TT.CardItem({
+  card: bc1, linkView: null, live: null,
+  onToggleMark: () => {}, onCopyTitle: () => {}, onNewChat: () => {}, onDispatch: () => {}, onOpen: () => {}, onOpenSession: () => {},
+});
+const noBoltActs = noBoltNode.children.find((n) => n && n.props && n.props.className === 'ztp-acts');
+check('CardItem：⚡ 按钮有 quickTitle 才渲染，点击回传卡片',
+  Boolean(boltBtn) && String(boltBtn.props.title).includes('工作区 · 模型 glm-x') && quickCard === bc1
+  && !flatNodes(noBoltActs.children).some((n) => n && String(n && n.props && n.props.title).startsWith('极速重发')));
+
+// ── 本地备注（2026-10-25 迭代）：notes.v1 卡片自己的备忘 ──
+window.localStorage.removeItem('dsh-zentao-panel.notes.v1');
+check('notes：saveNote 保存/读取/空串清除/trim',
+  (TT.saveNote('acctM', bc1, '  等张三回复后再动  '), TT.getNote(TT.readNoteMap(), 'acctM', bc1) === '等张三回复后再动')
+  && (TT.saveNote('acctM', bc1, '   '), TT.getNote(TT.readNoteMap(), 'acctM', bc1) === '')
+  && TT.readNoteMap()['acctM/bug-1'] === undefined);
+check('notes：noteLine 压空白 + 50 字截断（程序生成避免手数）',
+  TT.noteLine('a  b\n c') === 'a b c'
+  && TT.noteLine('备'.repeat(55)) === '备'.repeat(50) + '…'
+  && TT.noteLine('短备注') === '短备注'
+  && TT.noteLine(null) === '');
+check('notes：账号隔离', TT.saveNote('acctN', bc1, '另一个账号的备注') && TT.getNote(TT.readNoteMap(), 'acctM', bc1) === '');
+lsBacking.delete('dsh-zentao-panel.notes.v1');
+TT.saveNote('acct1', { kind: 'bug', id: 1 }, '在线卡备注', NOW);
+TT.saveNote('acct1', { kind: 'task', id: 77 }, '孤儿备注', NOW);
+TT.saveNote('acct2', { kind: 'bug', id: 1 }, '他账号备注', NOW - 100 * 3600 * 1000);
+check('cleanupStaleLinks 顺带清 notes：在线保留 / 孤儿超宽限删 / 他账号不动',
+  TT.cleanupStaleLinks('acct1', mineCards, NOW + 80 * 3600 * 1000) === true
+  && TT.getNote(TT.readNoteMap(), 'acct1', { kind: 'bug', id: 1 }) === '在线卡备注'
+  && TT.readNoteMap()['acct1/task-77'] === undefined
+  && TT.readNoteMap()['acct2/bug-1'] !== undefined);
+window.localStorage.removeItem('dsh-zentao-panel.notes.v1');
+const noteNode = TT.CardItem({
+  card: bc1, linkView: null, live: null, note: '备注摘要测试',
+  onToggleMark: () => {}, onCopyTitle: () => {}, onNewChat: () => {}, onDispatch: () => {}, onOpen: () => {}, onOpenSession: () => {},
+});
+const noteLineNode = noteNode.children.find((n) => n && n.props && n.props.className === 'ztp-note-line');
+let noteSaved = null;
+const noteDv = TT.DetailView({
+  card: bc1, rpc: () => {}, live: null, onBack: () => {},
+  onCopyMd: () => {}, note: '旧备注', onSaveNote: (c, t) => { noteSaved = [c, t]; },
+});
+const noteEditor = noteDv.children.find((n) => n && n.props && n.props.className === 'ztp-note-edit');
+const noteArea = noteEditor.children.find((n) => n && n.type === 'textarea');
+const noteSaveBtn = noteEditor.children[2].children.find((n) => n && n.type === 'button');
+noteSaveBtn.props.onClick();
+check('CardItem 备注摘要行 + DetailView 编辑区（textarea 初值/保存回传）',
+  Boolean(noteLineNode) && noteLineNode.children[1] === '备注摘要测试'
+  && Boolean(noteArea) && noteArea.props.value === '旧备注'
+  && noteSaved && noteSaved[0] === bc1);
+
+// ── 手动处理状态的 UI（卡片下拉 + 详情 chip + 徽标 manual 标记）──
+const manBadge = TT.LiveBadge({ state: 'done', since: NOW, manual: true });
+const autoBadge = TT.LiveBadge({ state: 'done', since: null, manual: false });
+check('LiveBadge：手动状态带 manual 类，title 标注「手动设置」；自动状态不加',
+  manBadge.props.className.split(' ').includes('manual')
+  && /手动设置/.test(manBadge.props.title)
+  && !autoBadge.props.className.split(' ').includes('manual')
+  && !/手动设置/.test(autoBadge.props.title));
+
+const selCalls = [];
+const manNode2 = TT.CardItem({
+  card: bc1, linkView: null, live: 'done', liveManual: 'done',
+  onSetState: (c, s) => { selCalls.push([c, s]); },
+  onToggleMark: () => {}, onCopyTitle: () => {}, onNewChat: () => {}, onDispatch: () => {},
+  onOpen: () => {}, onOpenSession: () => {},
+});
+const manTop2 = manNode2.children.find((n) => n && n.props && n.props.className === 'ztp-top');
+const manBadge2 = manTop2.children.find((n) => n && n.type === TT.LiveBadge);
+const manActs2 = manNode2.children.find((n) => n && n.props && n.props.className === 'ztp-acts');
+const manSel2 = flatNodes(manActs2.children).find((n) => n && n.type === 'select');
+check('CardItem：渲染「处理状态」下拉（回显手动值 + on + 五个选项）与带 manual 标记的徽标',
+  Boolean(manSel2) && manSel2.props.value === 'done'
+  && manSel2.props.className.split(' ').includes('on')
+  && manSel2.children.flat(3).filter((o) => o && o.type === 'option').map((o) => o.props.value).join()
+    === ',running,ask,done,ended'
+  && manBadge2 && manBadge2.props.manual === true && manBadge2.props.state === 'done');
+manSel2.props.onChange({ target: { value: 'running' } });
+manSel2.props.onChange({ target: { value: '' } });
+check('CardItem：下拉变更回传 (card, state)；选「自动」回传 null',
+  selCalls.length === 2 && selCalls[0][0] === bc1 && selCalls[0][1] === 'running'
+  && selCalls[1][1] === null);
+const autoNode2 = TT.CardItem({
+  card: bc1, linkView: null, live: null,
+  onToggleMark: () => {}, onCopyTitle: () => {}, onNewChat: () => {}, onDispatch: () => {},
+  onOpen: () => {}, onOpenSession: () => {},
+});
+const autoSel2 = flatNodes(autoNode2.children.find(
+  (n) => n && n.props && n.props.className === 'ztp-acts').children)
+  .find((n) => n && n.type === 'select');
+check('CardItem：无手动状态时下拉回显「状态：自动」且不带 on 类',
+  autoSel2.props.value === '' && !autoSel2.props.className.split(' ').includes('on'));
+
+const chipCalls = [];
+const manDv2 = TT.DetailView({
+  card: bc1, rpc: () => {}, live: 'done', manual: 'done', onBack: () => {},
+  onSetState: (c, s) => { chipCalls.push([c, s]); },
+});
+const stateEdit2 = manDv2.children.find((n) => n && n.props && n.props.className === 'ztp-state-edit');
+const chipBox2 = stateEdit2.children.find((n) => n && n.props && n.props.className === 'ztp-state-chips');
+const chipBtns2 = chipBox2.children.flat(2).filter(Boolean);
+check('DetailView：处理状态 chip 组（自动 + 四态），手动值高亮且带「手动设置」提示',
+  chipBtns2.length === 5 && chipBtns2[0].children[0] === '自动'
+  && !chipBtns2[0].props.className.split(' ').includes('on')
+  && chipBtns2.map((b) => b.children[0]).join() === '自动,处理中,等你决策,已完成,已结束'
+  && chipBtns2[3].props.className.split(' ').includes('on')
+  && stateEdit2.children[0].children.some((n) => n && n.props && n.props.className === 'ztp-state-hint'));
+chipBtns2[3].props.onClick();
+chipBtns2[0].props.onClick();
+check('DetailView：点 chip 回传 (card, state)；点「自动」清除手动设置（null）',
+  chipCalls.length === 2 && chipCalls[0][0] === bc1
+  && chipCalls[0][1] === 'done' && chipCalls[1][1] === null);
+const autoDv2 = TT.DetailView({ card: bc1, rpc: () => {}, live: null, onBack: () => {} });
+const autoChips2 = autoDv2.children.find((n) => n && n.props && n.props.className === 'ztp-state-edit')
+  .children.find((n) => n && n.props && n.props.className === 'ztp-state-chips')
+  .children.flat(2).filter(Boolean);
+check('DetailView：无手动状态时「自动」chip 高亮',
+  autoChips2[0].props.className.split(' ').includes('on')
+  && !autoChips2[3].props.className.split(' ').includes('on'));
+
+// ── 「已结束」手动终态（2026-10-27 用户要求：会话完成 = 已完成，另要一个人工收尾的状态）──
+// 只能手动（自动检测永不产出）；列表沉到最底 + 灰化；流程看板不显示；覆盖 done 作为最终状态。
+check('LIVE_STATES：已结束在可手动状态里，且排在最后（chip/下拉顺序）',
+  TT.LIVE_STATES.join() === 'running,ask,done,ended');
+const endedBadge = TT.LiveBadge({ state: 'ended', since: NOW, manual: true });
+const endedSvg = endedBadge.children.find((n) => n && n.type === 'svg');
+check('LiveBadge：已结束是灰色「封存章」（ended 类 + 方框 + 不再用 done 的对勾动画）',
+  endedBadge.props.className.split(' ').includes('ended')
+  && /已结束/.test(endedBadge.props.title)
+  && Boolean(endedSvg)
+  && endedSvg.children.some((n) => n && n.type === 'rect')
+  && !endedSvg.children.some((n) => n && n.props && n.props.className === 'ztp-live-ok'));
+const endedNode = TT.CardItem({
+  card: bc1, linkView: null, live: 'ended', liveManual: 'ended',
+  onToggleMark: () => {}, onCopyTitle: () => {}, onNewChat: () => {}, onDispatch: () => {},
+  onOpen: () => {}, onOpenSession: () => {},
+});
+const endedSel = flatNodes(endedNode.children).find((n) => n && n.type === 'select');
+check('CardItem：已结束卡片带 ztp-live-ended 灰化类，状态下拉回显「已结束」',
+  endedNode.props.className.split(' ').includes('ztp-live-ended')
+  && endedSel.props.value === 'ended'
+  && endedSel.children.flat(3).filter((o) => o && o.type === 'option').map((o) => o.props.value).join()
+    === ',running,ask,done,ended');
+const endedDv = TT.DetailView({ card: bc1, rpc: () => {}, live: 'ended', manual: 'ended', onBack: () => {} });
+const endedPanel = endedDv.children.find((n) => n && n.props && String(n.props.className).includes('ztp-panel-card'));
+const endedChips = endedDv.children.find((n) => n && n.props && n.props.className === 'ztp-state-edit')
+  .children.find((n) => n && n.props && n.props.className === 'ztp-state-chips')
+  .children.flat(2).filter(Boolean);
+check('DetailView：已结束面板灰化 + chip 高亮「已结束」',
+  endedPanel.props.className.split(' ').includes('ztp-live-ended')
+  && endedChips[4].children[0] === '已结束'
+  && endedChips[4].props.className.split(' ').includes('on')
+  && !endedChips[3].props.className.split(' ').includes('on'));
+
+// ── 完成闭环（2026-10-25 迭代）：finishUrl 深链 + 详情 done 态按钮 ──
+check('finishUrl：三类卡片替换为操作页（同 base 同 id）',
+  TT.finishUrl({ kind: 'bug', id: 123, url: 'http://z:8090/bug-view-123.html' }) === 'http://z:8090/bug-resolve-123.html'
+  && TT.finishUrl({ kind: 'task', id: 9, url: 'http://z/task-view-9.html' }) === 'http://z/task-finish-9.html'
+  && TT.finishUrl({ kind: 'story', id: 8, url: 'http://z/story-view-8.html' }) === 'http://z/story-close-8.html');
+check('finishUrl：kind 不认识 / url 形态不符 / 无 url / 空卡 → null',
+  TT.finishUrl({ kind: 'case', id: 1, url: 'http://z/case-view-1.html' }) === null
+  && TT.finishUrl({ kind: 'bug', id: 1, url: 'http://z/bug-browse-1.html' }) === null
+  && TT.finishUrl({ kind: 'bug', id: 1 }) === null
+  && TT.finishUrl(null) === null);
+const finCard = { kind: 'bug', id: 16174, title: '财务共享中心系统', status: 'active', url: 'http://z:8090/bug-view-16174.html' };
+const dvDone = TT.DetailView({ card: finCard, rpc: () => {}, live: 'done', onBack: () => {} });
+const dvPop = dvDone.children.find((n) => n && n.props && String(n.props.className).includes('ztp-panel-card'));
+const finRow = dvDone.children.find((n) => n && n.props && n.props.className === 'ztp-finish-row');
+check('DetailView done 态：渲染「去禅道标记完成」外链（href=操作页深链）',
+  Boolean(finRow) && finRow.children[0].type === 'a'
+  && finRow.children[0].props.href === 'http://z:8090/bug-resolve-16174.html'
+  && finRow.children[0].props.target === '_blank'
+  && finRow.children[0].children[0] === '去禅道标记完成');
+const dvRun = TT.DetailView({ card: finCard, rpc: () => {}, live: 'running', onBack: () => {} });
+const dvRunPop = dvRun.children.find((n) => n && n.props && String(n.props.className).includes('ztp-panel-card'));
+check('DetailView 非 done 态 / 无 url：不渲染闭环按钮',
+  !dvRun.children.some((n) => n && n.props && n.props.className === 'ztp-finish-row')
+  && !TT.DetailView({ card: { kind: 'bug', id: 1, title: 'x', status: 'active' }, rpc: () => {}, live: 'done', onBack: () => {} })
+    .children.some((n) => n && n.props && String(n.props.className).includes('ztp-finish-row')));
+
+// 批量会话关联：N 卡指向同一会话，反查（会话头部「禅道」按钮用）能命中
+TT.saveSessionLink('acctB', bc1, 's-batch');
+TT.saveSessionLink('acctB', bc2, 's-batch');
+TT.saveSessionLink('acctB', bc3, 's-batch');
+const lmBatch = TT.readLinkMap();
+check('批量下发后逐卡关联同一会话 + findLinkBySession 反查命中',
+  lmBatch['acctB/bug-1'] && lmBatch['acctB/bug-1'].sessionId === 's-batch'
+  && lmBatch['acctB/bug-2'] && lmBatch['acctB/bug-2'].sessionId === 's-batch'
+  && lmBatch['acctB/task-3'] && lmBatch['acctB/task-3'].sessionId === 's-batch'
+  && TT.findLinkBySession(lmBatch, 's-batch') !== null);
+
+// ── 账号别名（2026-10-25）──────────────────────────────────────
+check('acctDisplayName：别名优先，无别名退回账号，空安全',
+  TT.acctDisplayName({ account: 'zhangsan', alias: '公司禅道 · 张三' }) === '公司禅道 · 张三'
+  && TT.acctDisplayName({ account: 'zhangsan', alias: '' }) === 'zhangsan'
+  && TT.acctDisplayName({ account: 'zhangsan' }) === 'zhangsan'
+  && TT.acctDisplayName({ account: 'lisi', alias: '   ' }) === 'lisi'
+  && TT.acctDisplayName({ alias: '纯别名' }) === '纯别名'
+  && TT.acctDisplayName(null) === '');
+
+// AccountSwitcher 展示路径（fake useState 恒 null → 只渲染非编辑分支；
+// 行内编辑/确认交互由真实 React 承担，RPC 链路在 multi/host 测试覆盖）
+let pickedAcct = null;
+const swNode = TT.AccountSwitcher({
+  accounts: [
+    { id: 'a1', account: 'zhangsan', alias: '公司 · 张三', baseUrl: 'http://z1.example.com:8090/', loggedIn: true },
+    { id: 'a2', account: 'lisi', baseUrl: 'http://z2.example.com:8090/', loggedIn: false },
+  ],
+  activeId: 'a1',
+  onPick: (a) => { pickedAcct = a; }, onRename: () => {}, onRemove: () => {}, onAdd: () => {}, onClose: () => {},
+});
+// fake createElement 不展平 children：pop.children = [[row1,row2], addButton]
+const swRows = swNode.children[0].children[0];
+const rowMain = (row) => row.children[0][0]; // [main, edit, dot, del] 打包成单个数组 child
+check('账号菜单：主名显示别名、原账号+主机名下沉副行',
+  rowMain(swRows[0]).children[0].children[0] === '公司 · 张三'
+  && rowMain(swRows[0]).children[1].children[0] === 'zhangsan · z1.example.com:8090');
+check('账号菜单：无别名行主名=账号、副行=主机名',
+  rowMain(swRows[1]).children[0].children[0] === 'lisi'
+  && rowMain(swRows[1]).children[1].children[0] === 'z2.example.com:8090');
+check('账号菜单：激活行高亮 + 铅笔改名按钮 + 登录点/移除按钮齐备',
+  swRows[0].props.className.split(' ').includes('on') && !swRows[1].props.className.includes('on')
+  && swRows[0].children[0][1].props.className === 'ztp-acct-edit-btn'
+  && swRows[0].children[0][2].props.title === '已登录'
+  && swRows[0].children[0][3].props.className === 'ztp-acct-del');
+let editStopProp = false;
+swRows[0].children[0][1].props.onClick({ stopPropagation: () => { editStopProp = true; } });
+(swRows[0].props.onClick(), undefined);
+check('账号菜单：点行切换账号、点改名不冒泡（stopPropagation）',
+  ((() => { swRows[1].props.onClick(); return pickedAcct && pickedAcct.id === 'a2'; })())
+  && editStopProp === true);
+
+// ── 图片内存缓存（url → dataURL，模块级；面板重挂/重开详情秒出，2026-10-25）──
+TT.imageCache.clear();
+
+check('imageDataUrlParts：dataURL → mediaType/base64；非 dataURL / 空 → null',
+  (() => { const p = TT.imageDataUrlParts('data:image/png;base64,QUJD'); return p && p.mediaType === 'image/png' && p.base64 === 'QUJD'; })()
+  && TT.imageDataUrlParts('http://z/1.png') === null
+  && TT.imageDataUrlParts('data:text/plain,hello') === null
+  && TT.imageDataUrlParts('') === null && TT.imageDataUrlParts(null) === null);
+
+TT.rememberImageSrc('http://z/a.png', 'data:image/png;base64,QQ');
+TT.rememberImageSrc('http://z/a.png', 'data:image/png;base64,QQ==');
+check('rememberImageSrc 写入 / 覆盖更新 / cachedImageSrc 读回',
+  TT.cachedImageSrc('http://z/a.png') === 'data:image/png;base64,QQ=='
+  && TT.cachedImageSrc('http://z/never.png') === null
+  && (TT.rememberImageSrc('http://z/bad.png', ''), TT.cachedImageSrc('http://z/bad.png') === null) /* 空值不写 */);
+
+// 张数淘汰：塞满 MAX+1 张 → 最旧的被淘汰、最新的保留
+TT.imageCache.clear();
+for (let i = 0; i < TT.IMAGE_CACHE_MAX + 1; i++) TT.rememberImageSrc(`http://z/n${i}.png`, `data:image/png;base64,${i}`);
+check(`张数淘汰：上限 ${TT.IMAGE_CACHE_MAX} 张，最旧先出`,
+  TT.imageCache.size === TT.IMAGE_CACHE_MAX
+  && TT.cachedImageSrc('http://z/n0.png') === null
+  && TT.cachedImageSrc(`http://z/n${TT.IMAGE_CACHE_MAX}.png`) !== null);
+
+// 字节淘汰：单条超预算可独占缓存（保至少 1 张），再来一条把超大的挤出去
+TT.imageCache.clear();
+TT.rememberImageSrc('http://z/big.png', 'data:image/png;base64,' + 'A'.repeat(TT.IMAGE_CACHE_MAX_BYTES + 10));
+TT.rememberImageSrc('http://z/small.png', 'data:image/png;base64,QQ');
+check('字节淘汰：总量超预算时最旧先出，最新保留', TT.imageCache.size === 1
+  && TT.cachedImageSrc('http://z/big.png') === null
+  && TT.cachedImageSrc('http://z/small.png') === 'data:image/png;base64,QQ');
+
+// loadDetailImages（DetailImages 取图内核）：未命中走 RPC 并回写缓存；命中同步回填不再 RPC
+TT.imageCache.clear();
+let imgRpcN = 0;
+ctx.connection.rpc.call = async (channel, endpoint) => {
+  if (endpoint !== 'zentao.image') return { ok: false, error: { message: 'unexpected ' + endpoint } };
+  imgRpcN++;
+  return { ok: true, value: { name: '1.png', mediaType: 'image/png', base64: 'QUJD', bytes: 3 } };
+};
+let marks1 = [];
+TT.loadDetailImages(['http://z/la-1.png'], (i, url, patch) => marks1.push({ i, url, patch }));
+await new Promise((r) => setTimeout(r, 5));
+check('loadDetailImages 首次：走 RPC，成功 mark src 并回写缓存',
+  imgRpcN === 1 && marks1.length === 1 && marks1[0].patch.src === 'data:image/png;base64,QUJD'
+  && TT.cachedImageSrc('http://z/la-1.png') === 'data:image/png;base64,QUJD');
+let marks2 = [];
+TT.loadDetailImages(['http://z/la-1.png'], (i, url, patch) => marks2.push({ i, url, patch }));
+check('loadDetailImages 缓存命中：同步回填、不再发 RPC', imgRpcN === 1
+  && marks2.length === 1 && marks2[0].patch.src === 'data:image/png;base64,QUJD');
+
+// 失败不缓存（下次挂载重试）
+ctx.connection.rpc.call = async () => ({ ok: false, error: { message: 'boom' } });
+let marks3 = [];
+TT.loadDetailImages(['http://z/la-2.png'], (i, url, patch) => marks3.push({ i, url, patch }));
+await new Promise((r) => setTimeout(r, 5));
+check('loadDetailImages 失败：mark failed、不写缓存', marks3.length === 1 && marks3[0].patch.failed === true
+  && TT.cachedImageSrc('http://z/la-2.png') === null);
+
+// cancel 后迟到的 RPC 回调作废
+let lateResolve = null;
+ctx.connection.rpc.call = () => new Promise((res) => { lateResolve = res; });
+let marks4 = [];
+const cancel4 = TT.loadDetailImages(['http://z/la-3.png'], (i, url, patch) => marks4.push({ i, url, patch }));
+cancel4();
+lateResolve({ ok: true, value: { name: '1.png', mediaType: 'image/png', base64: 'QUJD', bytes: 3 } });
+await new Promise((r) => setTimeout(r, 5));
+check('loadDetailImages cancel：卸载后迟到回调作废', marks4.length === 0);
+
+// 预取 / 附件管线复用同一缓存：已看过的图下发时不重拉
+TT.imageCache.clear();
+imgRpcN = 0;
+ctx.connection.rpc.call = async (channel, endpoint) => {
+  if (endpoint !== 'zentao.image') return { ok: false, error: { message: 'unexpected ' + endpoint } };
+  imgRpcN++;
+  return { ok: true, value: { name: 'x.png', mediaType: 'image/png', base64: base64Png, bytes: 10 } };
+};
+const pcImgs = [{ url: 'http://z/pc-1.png', name: 'pc1.png' }, { url: 'http://z/pc-2.png', name: 'pc2.png' }];
+const pc1 = await TT.prefetchImageBytes(pcImgs);
+check('prefetchImageBytes 首次逐张走 RPC（并回写缓存）',
+  imgRpcN === 2 && pc1.length === 2 && pc1.every(Boolean));
+const pc2 = await TT.prefetchImageBytes(pcImgs);
+check('prefetchImageBytes 二次命中缓存：0 RPC，name 取自图片引用',
+  imgRpcN === 2 && pc2.length === 2 && pc2[0].name === 'pc1.png' && pc2[0].mediaType === 'image/png');
+const attCached = await TT.attachImagesToDraft(pcImgs, { sessionId: 's-c', facade: evFacade, conversation: evConversation });
+check('attachImagesToDraft 缓存命中：不发 RPC 照常建附件',
+  imgRpcN === 2 && attCached.ok === true && attCached.count === 2);
+
+
+// ── 继续处理（2026-10-25 迭代）：往关联会话追加指令 ──
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let contDraft = null, contSubmitted = 0, contRetained = null, contReleased = 0;
+  const contFacade = { setDraft(t) { contDraft = t; }, submit() { contSubmitted++; } };
+  ctx.get = function (name) {
+    if (name === 'sessions') return {
+      scope: () => ({ sid: 's9' }),
+      retain(id, opts) { contRetained = { id, opts }; return { release() { contReleased++; } }; },
+    };
+    if (name === 'conversation') return { input: { for: () => contFacade } };
+    return undefined;
+  };
+  const rOk = await mod._test.continueInSession('s-link', '【继续处理 禅道Bug #1】\n把代码改了');
+  await sleep(320);
+  check('continueInSession：retain(zentao-panel) → setDraft → 250ms 后 submit',
+    rOk.ok === true && rOk.sessionId === 's-link'
+    && contRetained && contRetained.id === 's-link' && contRetained.opts.source === 'zentao-panel'
+    && contDraft === '【继续处理 禅道Bug #1】\n把代码改了'
+    && contSubmitted === 1 && contReleased === 0);
+  await sleep(3000);
+  check('continueInSession：3s 后释放后台 retain', contReleased === 1);
+  const rEmpty = await mod._test.continueInSession('s-link', '   ');
+  check('continueInSession：空白文本 → empty 不动作',
+    rEmpty.ok === false && rEmpty.reason === 'empty');
+  ctx.get = function (name) { return name === 'sessions' ? { scope: () => null } : undefined; };
+  const rUnsup = await mod._test.continueInSession('s-link', 'x');
+  check('continueInSession：conversation 缺失 → unsupported', rUnsup.ok === false && rUnsup.reason === 'unsupported');
+  let rel2 = 0;
+  ctx.get = function (name) {
+    if (name === 'sessions') return { scope: () => null, retain: () => ({ release() { rel2++; } }) };
+    if (name === 'conversation') return { input: { for: () => null } };
+    return undefined;
+  };
+  const rUnavail = await mod._test.continueInSession('s-link', 'x');
+  check('continueInSession：scope/facade 拿不到 → unavailable 且立即释放 retain',
+    rUnavail.ok === false && rUnavail.reason === 'unavailable' && rel2 === 1);
+}
+
+// DetailView：关联会话存在时显示「继续处理…」入口（onContinue 缺失则不显示）
+let contCalled = null;
+const contDv = TT.DetailView({
+  card: bc1, rpc: () => {}, live: 'done', onBack: () => {}, onCopyMd: () => {}, note: '',
+  onSaveNote: () => {}, replyLink: { sessionId: 's-link', at: 1 }, reply: null,
+  onContinue: (c, t) => { contCalled = [c, t]; },
+});
+const contWrap = contDv.children.find((n) => n && n.props && n.props.className === 'ztp-reply-wrap');
+const contMeta = contWrap.children.find((n) => n && n.props && n.props.className === 'ztp-reply-meta');
+const contBtn = contMeta.children.find((n) => n && n.type === 'button' && n.children[0] === '继续处理…');
+contBtn.props.onClick(); // 展开（fake useState 恒初值 false，展开框不渲染，按钮结构可断言）
+const contDvNo = TT.DetailView({
+  card: bc1, rpc: () => {}, live: null, onBack: () => {}, onCopyMd: () => {}, note: '', onSaveNote: () => {},
+  replyLink: { sessionId: 's-link', at: 1 }, reply: null,
+});
+const contWrapNo = contDvNo.children.find((n) => n && n.props && n.props.className === 'ztp-reply-wrap');
+const contMetaNo = contWrapNo.children.find((n) => n && n.props && n.props.className === 'ztp-reply-meta');
+check('DetailView：关联会话存在 → 「继续处理…」按钮渲染；onContinue 缺失不渲染',
+  Boolean(contBtn) && contBtn.props.onClick() === undefined
+  && !contMetaNo.children.some((n) => n && n.type === 'button' && n.children[0] === '继续处理…'));
+
+// ── 卡片回复摘要行（2026-10-25 迭代）：agent 最后回复一行预览 ──
+check('replyLine：压空白 + 60 字截断（程序生成避免手数）',
+  TT.replyLine('a  b\n c') === 'a b c'
+  && TT.replyLine('答'.repeat(70)) === '答'.repeat(60) + '…'
+  && TT.replyLine('短回复') === '短回复' && TT.replyLine(null) === '');
+const rlNode = TT.CardItem({
+  card: bc1, linkView: null, live: 'done', note: '备注', replySummary: '已定位到根因：并发写冲突',
+  onToggleMark: () => {}, onCopyTitle: () => {}, onNewChat: () => {}, onDispatch: () => {}, onOpen: () => {}, onOpenSession: () => {},
+});
+const rlLine = rlNode.children.find((n) => n && n.props && n.props.className === 'ztp-reply-line');
+check('CardItem：备注行与回复摘要行并存，回复行在备注行之后',
+  Boolean(rlLine) && rlLine.children[1] === '已定位到根因：并发写冲突'
+  && rlNode.children.filter((n) => n && n.props && (n.props.className === 'ztp-note-line' || n.props.className === 'ztp-reply-line')).length === 2);
+
+// ── 决策应答台（2026-10-25 迭代）：ask 态在面板内直接回复 agent ──
+let askSent = [];
+const askDv = TT.DetailView({
+  card: bc1, rpc: () => {}, live: 'ask', onBack: () => {}, onCopyMd: () => {}, note: '', onSaveNote: () => {},
+  onContinue: (c, t) => { askSent.push([c, t]); },
+});
+const askBox = askDv.children.find((n) => n && n.props && n.props.className === 'ztp-ask-box');
+const askActs = askBox.children.find((n) => n && n.props && n.props.className === 'ztp-note-acts');
+const askAgreeBtn = askActs.children.find((n) => n && n.type === 'button' && n.children[0] === '同意，继续执行');
+const askCustomBtn = askActs.children.find((n) => n && n.type === 'button' && n.children[0] === '自定义回复…');
+askAgreeBtn.props.onClick();
+const askDvNo = TT.DetailView({
+  card: bc1, rpc: () => {}, live: 'done', onBack: () => {}, onCopyMd: () => {}, note: '', onSaveNote: () => {},
+  onContinue: () => {},
+});
+check('决策应答台：ask 态渲染（标题/说明/一键同意/自定义入口），一键同意回传固定答复；非 ask 不渲染',
+  Boolean(askBox) && askBox.children[0].children[0] === 'agent 正等你决策'
+  && Boolean(askAgreeBtn) && Boolean(askCustomBtn)
+  && askSent.length === 1 && askSent[0][0] === bc1 && askSent[0][1] === '同意，请继续执行。'
+  && !askDvNo.children.some((n) => n && n.props && n.props.className === 'ztp-ask-box'));
+
+// ── 流程看板（2026-10-25 用户提案·方案 A）：四列泳道 ──
+const bdLive = (c) => ({ 11: 'running', 12: 'ask', 13: 'done', 15: 'running', 77: 'ended' }[c.id] || null);
+const bdCards = [
+  qfToday, qfOverdue, qfTomorrow, qfLive, // id 11,12,13,15 → running/ask/done/running
+  bc1, // id 1 无活性 → todo
+  { kind: 'bug', id: 99, title: '已关闭', status: 'closed' }, // 禅道终态 → 不入板
+  { kind: 'bug', id: 77, title: '已结束', status: 'active' }, // 手动已结束 → 不入板
+];
+const bdCols = TT.boardColumns(bdCards, bdLive, nowTs);
+check('boardColumns：null→待处理 / running/ask/done 各归列 / 禅道终态与已结束不入板',
+  bdCols.todo.map((c) => c.id).join() === '1'
+  && bdCols.running.map((c) => c.id).join() === '11,15'
+  && bdCols.ask.map((c) => c.id).join() === '12'
+  && bdCols.done.map((c) => c.id).join() === '13'
+  && !JSON.stringify(bdCols).includes('"id":99')
+  && !JSON.stringify(bdCols).includes('"id":77'));
+check('boardColumns：段内按截止升序（running 列 11(今天) 在 15(无截止) 前）',
+  bdCols.running[0].id === 11);
+let bdPicked = null;
+const bdNode = TT.BoardView({
+  cards: bdCards, liveOf: bdLive, flaggedOf: (c) => c.id === 11,
+  onPick: (c) => { bdPicked = c; },
+});
+// 列 = BOARD_COLS.map（唯一 child 的 map 数组）；列体 = KIND_ORDER.map（组 null/[组头,卡数组]）
+const bdFlat = bdNode.children.length === 4 ? bdNode.children : bdNode.children.flat(2);
+check('BoardView：四列带标题与计数',
+  bdFlat.length === 4
+  && bdFlat[0].children[0].children[1] === '待处理' && bdFlat[0].children[0].children[2].children[0] === 1
+  && bdFlat[1].children[0].children[1] === '处理中' && bdFlat[1].children[0].children[2].children[0] === 2
+  && bdFlat[3].children[0].children[1] === '已完成待闭环');
+const bdColCards = (col) => col.children[1].children.flat(3).filter(Boolean); // 列体 children：组 null/[组头,卡数组] 嵌套
+const bdRunBody = bdColCards(bdFlat[1]);
+const bdRunGrps = bdRunBody.filter((n) => n && n.props && n.props.className === 'ztp-bgrp');
+const bdRunCards = bdRunBody.filter((n) => n && n.props && String(n.props.className).startsWith('ztp-bcard'));
+check('BoardView：列内按类型分组（running 列 = Bug 组 + 需求 组，组头带类型色点与计数）',
+  bdRunGrps.length === 2
+  && bdRunGrps[0].children[1] === 'Bug' && bdRunGrps[0].children[2].children[0] === 1
+  && bdRunGrps[0].children[0].props.className === 'ztp-bgrp-dot ztp-k-bug'
+  && bdRunGrps[1].children[1] === '需求' && bdRunGrps[1].children[2].children[0] === 1
+  && bdRunCards.length === 2
+  && bdRunCards.every((n) => /ztp-k-(bug|story)/.test(n.props.className)));
+bdRunCards[0].props.onClick();
+const bdAskCards = bdColCards(bdFlat[2]).filter((n) => n && n.props && String(n.props.className).startsWith('ztp-bcard'));
+const bdAskDeep = bdAskCards.flatMap((n) => n.children).filter(Boolean);
+check('BoardView：点缩略卡回传 onPick；逾期卡在 ask 列、截止 chip 带 overdue 类',
+  bdPicked && bdPicked.kind === 'bug' && bdPicked.id === 11
+  && bdAskDeep.some((row) => row && row.children && row.children.some(
+    (m) => m && m.props && String(m.props.className).split(' ').includes('overdue'))));
+
+// ── 看板动效契约（2026-10-27）：换列检测 / 光点坐标 / 截止文案 / 站头字形 ──
+const laneMapA = TT.boardLaneMap(TT.boardColumns(bdCards, bdLive, nowTs));
+check('boardLaneMap：kind-id → 车道；禅道终态与已结束卡不入图',
+  laneMapA['bug-11'] === 'running' && laneMapA['task-12'] === 'ask'
+  && laneMapA['bug-13'] === 'done' && !('bug-99' in laneMapA) && !('bug-77' in laneMapA));
+const noMotions = TT.boardMotions(null, laneMapA);
+check('boardMotions：首次挂载只建基线，不放动效（打开面板不满屏乱跳）',
+  Object.keys(noMotions.cards).length === 0 && noMotions.moved === null);
+const laneMapB = Object.assign({}, laneMapA, {
+  'bug-11': 'ask', 'task-12': 'todo', 'story-15': 'done', 'task-77': 'todo',
+});
+const mo = TT.boardMotions(laneMapA, laneMapB);
+check('boardMotions：换列记 move（前进 fwd / 回退 back，带 from）',
+  mo.cards['bug-11'].kind === 'move' && mo.cards['bug-11'].dir === 'fwd'
+  && mo.cards['bug-11'].from === 'running'
+  && mo.cards['task-12'].dir === 'back' && mo.cards['task-12'].from === 'ask');
+check('boardMotions：新卡记 new；moved 只取最后一颗光点（不弹球）',
+  mo.cards['task-77'].kind === 'new'
+  && mo.moved && mo.moved.from === 'ask' && mo.moved.to === 'todo');
+check('laneCenterPct：四站中心 12.5 / 37.5 / 62.5 / 87.5',
+  TT.laneCenterPct('todo') === 12.5 && TT.laneCenterPct('running') === 37.5
+  && TT.laneCenterPct('ask') === 62.5 && TT.laneCenterPct('done') === 87.5);
+const dueNow = new Date('2026-10-25T10:00:00').getTime();
+check('boardDue：逾期按日历天（逾期 5 天 / overdue）',
+  TT.boardDue('2026-10-20', dueNow).text === '逾期 5 天'
+  && TT.boardDue('2026-10-20', dueNow).tone === 'overdue');
+check('boardDue：今天 / 明天 / N 天后 → soon，更远只留 MM-DD',
+  TT.boardDue('2026-10-25', dueNow).text === '今天'
+  && TT.boardDue('2026-10-26', dueNow).text === '明天'
+  && TT.boardDue('2026-10-28', dueNow).text === '3 天后'
+  && TT.boardDue('2026-10-28', dueNow).tone === 'soon'
+  && TT.boardDue('2026-11-10', dueNow).text === '11-10'
+  && TT.boardDue('2026-11-10', dueNow).tone === ''
+  && TT.boardDue('2027-01-15', dueNow).text === '2027-01-15');
+check('boardDue：空/坏日期 → null', TT.boardDue('', dueNow) === null && TT.boardDue('xx', dueNow) === null);
+check('BoardGlyph：四站字形各不同（空心圈 / 均衡器 / 琥珀点 / 对勾）',
+  TT.BoardGlyph({ lane: 'todo' }).props.className === 'ztp-bglyph todo'
+  && TT.BoardGlyph({ lane: 'running', live: true }).props.className === 'ztp-bglyph running live'
+  && TT.BoardGlyph({ lane: 'running' }).props.className === 'ztp-bglyph running'
+  && TT.BoardGlyph({ lane: 'ask', live: true }).props.className === 'ztp-bglyph ask live'
+  && TT.BoardGlyph({ lane: 'done' }).props.className === 'ztp-bglyph done'
+  && TT.BoardGlyph({ lane: 'done' }).children[0].type === 'svg'
+  && TT.BoardGlyph({ lane: 'todo' }).children.length === 0);
+const bdDoneCards = bdColCards(bdFlat[3]).filter(
+  (n) => n && n.props && String(n.props.className).startsWith('ztp-bcard'));
+const bdDoneMeta = bdDoneCards[0].children.find((n) => n && n.props && n.props.className === 'ztp-bcard-t');
+check('BoardView：done 列缩略卡带绿色对勾；每张卡都有 hover 进入箭头',
+  bdDoneMeta.children.some((n) => n && n.props && n.props.className === 'ztp-bok')
+  && bdDoneCards[0].children.some((n) => n && n.props && n.props.className === 'ztp-bcard-go'));
+const bdEmpty = TT.BoardView({ cards: [], liveOf: null, flaggedOf: () => false, onPick: () => {} });
+const bdEmptyLanes = bdEmpty.children.flat(2);
+check('BoardView：空车道给出下一步文案（不是一根横线）',
+  bdEmptyLanes.length === 4
+  && bdEmptyLanes.every((lane) => lane.children[1].children[0].props.className === 'ztp-bcol-empty')
+  && textOf(bdEmptyLanes[0].children[1]) === '没有排队的事项'
+  && textOf(bdEmptyLanes[2].children[1]) === '没有等你决策的事项');
+
+// 选中态二轮加强：active 卡片带「查看中」文字角标（不依赖颜色感知）
+const actNode = TT.CardItem({
+  card: bc1, active: true, live: null, linkView: null,
+  onOpen: () => {}, onNewChat: () => {}, onDispatch: () => {}, onCopyTitle: () => {},
+  onToggleMark: () => {}, onOpenSession: () => {},
+});
+const actMeta = actNode.children.find((n) => n && n.props && n.props.className === 'ztp-top').children.find((n) => n && n.props && n.props.className === 'ztp-top-meta');
+const actBadge = actMeta.children[actMeta.children.length - 1];
+check('CardItem active 态：顶行渲染「查看中」内联标签（不再是右上角折角，避免盖住截止）',
+  actBadge.props.className === 'ztp-viewing-badge' && actBadge.children[0] === '查看中');
+
+// ── 列表卡片样式收口（2026-10-27）：相对截止 / 身份列稳定 / 创建人下沉 ──
+const todayIso = (() => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+})();
+const stNode = TT.CardItem({
+  card: { kind: 'bug', id: 901, title: '样式收口', status: 'active', pri: 2, severity: 2, deadline: todayIso, openedBy: '张三' },
+  linkView: null, live: 'running',
+  onOpen: () => {}, onOpenSession: () => {}, onToggleMark: () => {}, onCopyTitle: () => {},
+  onNewChat: () => {}, onDispatch: () => {},
+});
+const stTop = stNode.children.find((n) => n && n.props && n.props.className === 'ztp-top');
+const stMeta = stTop.children.find((n) => n && n.props && n.props.className === 'ztp-top-meta');
+const stDl = stMeta.children.find((n) => n && n.props && String(n.props.className).startsWith('ztp-dl'));
+check('CardItem：截止用相对说法（今天），完整日期进 title',
+  Boolean(stDl) && textOf(stDl) === '今天' && stDl.props.title.includes(todayIso));
+const endedDueNode = TT.CardItem({
+  card: { kind: 'bug', id: 902, title: '已结束的逾期卡', status: 'active', deadline: '2020-01-01' },
+  linkView: null, live: 'ended',
+  onOpen: () => {}, onOpenSession: () => {}, onToggleMark: () => {}, onCopyTitle: () => {},
+  onNewChat: () => {}, onDispatch: () => {},
+});
+const endedDueMeta = endedDueNode.children
+  .find((n) => n && n.props && n.props.className === 'ztp-top').children
+  .find((n) => n && n.props && n.props.className === 'ztp-top-meta');
+const endedDue = endedDueMeta.children.find((n) => n && n.props && String(n.props.className).startsWith('ztp-dl'));
+check('CardItem：已结束卡不强调逾期（无 overdue 类，回退完整日期，title 不带逾期天数）',
+  Boolean(endedDue) && !endedDue.props.className.split(' ').includes('overdue')
+  && textOf(endedDue) === '2020-01-01' && !endedDue.props.title.includes('逾期'));
+check('CardItem：创建人不再占卡片顶行（下沉详情；搜索仍按卡片数据命中）',
+  !textOf(stMeta).includes('张三'));
+const stIdIdx = stTop.children.findIndex((n) => n && n.props && n.props.className === 'ztp-id');
+const stLiveIdx = stTop.children.findIndex((n) => n && n.type === TT.LiveBadge);
+check('CardItem：#id 固定在类型标签之后，活性徽标跟在其后（身份列不随状态跳动）',
+  stIdIdx >= 0 && stLiveIdx > stIdIdx);
+
+// ── 选中卡滚动定位（2026-10-25 用户反馈「跳转后不滚动」）──
+let scrolled = null;
+const fakeDoc = { querySelector: (sel) => (sel === '[data-zcard="bug-1"]'
+  ? { scrollIntoView: (o) => { scrolled = o; } } : null) };
+check('scrollCardIntoView：查 data-zcard 命中则 scrollIntoView(nearest/smooth)',
+  TT.scrollCardIntoView({ kind: 'bug', id: 1 }, fakeDoc) === true
+  && scrolled && scrolled.block === 'nearest' && scrolled.behavior === 'smooth'
+  && TT.scrollCardIntoView({ kind: 'bug', id: 2 }, fakeDoc) === false // 查不到 → false
+  && TT.scrollCardIntoView(null, fakeDoc) === false
+  && TT.scrollCardIntoView({ kind: 'bug', id: 1 }, null) === false);
+const anchorNode = TT.CardItem({ card: bc1, linkView: null, live: null, onOpen: () => {} });
+check('CardItem 根节点带 data-zcard 锚点（kind-id）',
+  anchorNode.props['data-zcard'] === 'bug-1');
+
+// ── 事项档案（2026-11-09）：项目/执行 · 工时口径 · 上游需求 ──
+const scTask = {
+  kind: 'task', id: 101, title: '任务A', status: 'wait',
+  executionName: '第二批迭代0930提测任务', moduleTitle: '电子档案/档案整理',
+  projectName: '财务共享中心系统-贵州农信项目',
+};
+check('档案：归属行任务取执行名、Bug 取产品名，拼模块、全空 → null',
+  TT.scopeTextOf(scTask) === '第二批迭代0930提测任务 · 电子档案/档案整理'
+  && TT.scopeTextOf({ kind: 'bug', productName: '财务共享中心系统' }) === '财务共享中心系统'
+  && TT.scopeTextOf({ kind: 'task', moduleTitle: '模块' }) === '模块'
+  && TT.scopeTextOf({ kind: 'task' }) === null
+  && TT.scopeTextOf(null) === null);
+check('档案：关联对象链接从 card.url 推 base，id 非法/url 形态不符 → null',
+  TT.relatedUrlOf({ url: 'http://zt/task-view-101.html' }, 'story', 8) === 'http://zt/story-view-8.html'
+  && TT.relatedUrlOf({ url: 'http://zt/task-view-101.html' }, 'bug', 202) === 'http://zt/bug-view-202.html'
+  && TT.relatedUrlOf({ url: 'http://zt/task-view-101.html' }, 'story', 0) === null
+  && TT.relatedUrlOf({ url: 'http://zt/my.html' }, 'story', 8) === null
+  && TT.relatedUrlOf(null, 'story', 8) === null);
+check('档案：工时文案（16h / 0.5h / 空值与非法值 → 空串）',
+  TT.fmtHours(16) === '16h' && TT.fmtHours(0.5) === '0.5h'
+  && TT.fmtHours(null) === '' && TT.fmtHours('') === '' && TT.fmtHours('x') === '');
+const hProgress = TT.hoursOf({ estimate: 16, consumed: 8, left: 8, progress: 75 }, {});
+const hRatio = TT.hoursOf({ estimate: 16, consumed: 8, left: 8 }, {});
+const hOver = TT.hoursOf({ estimate: 4, consumed: 8 }, {});
+const hDetail = TT.hoursOf({}, { estimate: 8, left: 3 });
+check('档案：hoursOf 优先 progress，其次 consumed/estimate（>100% 夹到 100），全缺 → null',
+  hProgress.pct === 75 && hRatio.pct === 50 && hOver.pct === 100
+  && TT.hoursOf({ kind: 'bug' }, {}) === null);
+check('档案：hoursOf 详情兜底（列表没带工时时用详情的）+ hoursText 缺项跳过',
+  hDetail.estimate === 8 && hDetail.left === 3 && hDetail.pct === null
+  && TT.hoursText(hRatio) === '预计 16h · 已耗 8h · 剩余 8h'
+  && TT.hoursText({ estimate: 2, consumed: null, left: null, pct: null }) === '预计 2h'
+  && TT.hoursText(null) === '');
+check('档案：refLabel 名字+id / 只有 id / 只有名字 / 空',
+  TT.refLabel('财务', 49) === '财务（#49）' && TT.refLabel('', 49) === '#49'
+  && TT.refLabel('X') === 'X' && TT.refLabel('', null) === '');
+check('档案：infoValue 先卡片后详情、空值不覆盖列表已有值',
+  TT.infoValue({ projectName: 'X' }, { projectName: '' }, 'projectName') === 'X'
+  && TT.infoValue({ projectName: '' }, { projectName: 'D' }, 'projectName') === 'D'
+  && TT.infoValue({}, { moduleTitle: '模块' }, 'moduleTitle') === '模块'
+  && TT.infoValue({}, {}, 'projectName') === '');
+const scNode = TT.CardItem({ card: scTask, linkView: null, live: null, onOpen: () => {} });
+const scLine = flatNodes(scNode.children).find((n) => n && n.props && n.props.className === 'ztp-scope');
+check('CardItem：标题下渲染归属行（执行 · 模块，单行小字）',
+  Boolean(scLine) && textOf(scLine) === '第二批迭代0930提测任务 · 电子档案/档案整理'
+  && scLine.props.title === '第二批迭代0930提测任务 · 电子档案/档案整理');
+const scBare = TT.CardItem({ card: { kind: 'bug', id: 2, title: 'b', status: 'active' }, linkView: null, live: null, onOpen: () => {} });
+check('CardItem：没有归属数据时不渲染空行',
+  !flatNodes(scBare.children).some((n) => n && n.props && n.props.className === 'ztp-scope'));
+const archCard = {
+  kind: 'task', id: 101, title: '任务A', status: 'wait',
+  assignedTo: '李宏博', openedBy: '徐峰',
+  project: 49, projectName: '财务共享中心系统-贵州农信项目',
+  execution: 58, executionName: '第二批迭代0930提测任务',
+  module: 788, moduleTitle: '电子档案/档案整理',
+  estimate: 16, consumed: 8, left: 8, progress: 50,
+  storyId: 8, storyTitle: '需求C', fromBug: 202,
+  url: 'http://zt.example/task-view-101.html',
+};
+const archDv = TT.DetailView({ card: archCard, rpc: () => {}, live: null, onBack: () => {} });
+const archKv = flatNodes(archDv.children).find((n) => n && n.props && n.props.className === 'ztp-kv');
+const archKvText = textOf(archKv);
+check('DetailView：档案行显示项目/执行/模块/需求/来源（名字带 #id）',
+  archKvText.includes('财务共享中心系统-贵州农信项目（#49）')
+  && archKvText.includes('第二批迭代0930提测任务（#58）')
+  && archKvText.includes('电子档案/档案整理')
+  && archKvText.includes('#8 需求C')
+  && archKvText.includes('Bug #202'));
+const archStoryLink = flatNodes(archKv.children).find((n) => n && n.type === 'a' && String(n.props.href).includes('story-view-8'));
+const archBugLink = flatNodes(archKv.children).find((n) => n && n.type === 'a' && String(n.props.href).includes('bug-view-202'));
+check('DetailView：需求与来源 Bug 是真链接（新标签打开禅道查看页）',
+  archStoryLink && archStoryLink.props.target === '_blank'
+  && archBugLink && archBugLink.props.href === 'http://zt.example/bug-view-202.html');
+const archHours = flatNodes(archDv.children).find((n) => n && n.props && n.props.className === 'ztp-hours');
+const archBarFill = archHours ? flatNodes(archHours.children).find((n) => n && n.type === 'i') : null;
+check('DetailView：工时行 + 进度条（预计/已耗/剩余 + 50%）',
+  Boolean(archHours) && textOf(archHours).includes('预计 16h · 已耗 8h · 剩余 8h')
+  && textOf(archHours).includes('50%')
+  && archBarFill && archBarFill.props.style['--ztp-p'] === '50%');
+const bugDv = TT.DetailView({
+  card: { kind: 'bug', id: 202, title: 'b', status: 'active', productName: '财务共享中心系统' },
+  rpc: () => {}, live: null, onBack: () => {},
+});
+check('DetailView：无工时字段（Bug）不渲染工时行，产品行照常',
+  !flatNodes(bugDv.children).some((n) => n && n.props && n.props.className === 'ztp-hours')
+  && textOf(flatNodes(bugDv.children).find((n) => n && n.props && n.props.className === 'ztp-kv')).includes('财务共享中心系统'));
+
+// ── 详情内存缓存 + 挂载静默刷新（2026-11-09 用户反馈「每次打开都要加载一下」）──
+TT.clearDetailCache();
+const cacheCard = { kind: 'bug', id: 16964, title: 'x' };
+check('详情缓存：键带账号（多实例下同 kind-id 不是同一条）',
+  TT.detailCacheKey('acctA', cacheCard) === 'acctA/bug-16964'
+  && TT.detailCacheKey(null, cacheCard) === 'anon/bug-16964'
+  && TT.detailCacheKey('acctA', null) === 'acctA/null-null');
+TT.writeDetailCache('acctA', cacheCard, { desc: '第一版' }, 1000);
+check('详情缓存：写入后能读回；别的账号读不到',
+  TT.readDetailCache('acctA', cacheCard, 2000)?.desc === '第一版'
+  && TT.readDetailCache('acctB', cacheCard, 2000) === null
+  && TT.readDetailCache('acctA', null, 2000) === null);
+check('详情缓存：TTL 到期即失效（过期读返回 null 并清掉条目）',
+  TT.readDetailCache('acctA', cacheCard, 1000 + TT.DETAIL_CACHE_TTL_MS)?.desc === '第一版'
+  && TT.readDetailCache('acctA', cacheCard, 1001 + TT.DETAIL_CACHE_TTL_MS) === null
+  && TT.detailCache.size === 0);
+TT.clearDetailCache();
+for (let i = 0; i < TT.DETAIL_CACHE_MAX + 1; i++) {
+  TT.writeDetailCache('acctA', { kind: 'bug', id: i + 1 }, { n: i }, 1000);
+}
+const oldestGone = TT.readDetailCache('acctA', { kind: 'bug', id: 1 }, 2000) === null;
+const secondOldestAlive = TT.readDetailCache('acctA', { kind: 'bug', id: 2 }, 2000)?.n === 1;
+check('详情缓存：上限 LRU（写满后再写一条，最旧的先出）',
+  TT.detailCache.size === TT.DETAIL_CACHE_MAX && oldestGone && secondOldestAlive);
+TT.clearDetailCache();
+for (let i = 0; i < TT.DETAIL_CACHE_MAX; i++) {
+  TT.writeDetailCache('acctA', { kind: 'bug', id: i + 1 }, { n: i }, 1000);
+}
+TT.readDetailCache('acctA', { kind: 'bug', id: 1 }, 2000); // 用到 id=1 → 挪到队尾
+TT.writeDetailCache('acctA', { kind: 'bug', id: 999 }, { n: 'new' }, 1000);
+check('详情缓存：命中即刷新 LRU 顺序（用过的不先淘汰）',
+  TT.readDetailCache('acctA', { kind: 'bug', id: 1 }, 2000)?.n === 0
+  && TT.readDetailCache('acctA', { kind: 'bug', id: 2 }, 2000) === null
+  && TT.readDetailCache('acctA', { kind: 'bug', id: 999 }, 2000)?.n === 'new');
+TT.clearDetailCache();
+check('详情缓存：clearDetailCache 清空 / 空值不写入',
+  (TT.writeDetailCache('acctA', cacheCard, null), TT.detailCache.size === 0)
+  && (TT.writeDetailCache('acctA', null, { desc: 'x' }), TT.detailCache.size === 0));
+check('静默刷新判定：有 paneCache 列表或快照就不转圈（含「已知为空」），全无才走 loading',
+  TT.hasListData({ cards: [{ id: 1 }] }, null) === true
+  && TT.hasListData(null, { cards: [] }) === true
+  && TT.hasListData({ cards: [] }, null) === true
+  && TT.hasListData(null, null) === false
+  && TT.hasListData(null, { at: 1 }) === false
+  && TT.hasListData(undefined, { cards: 'x' }) === false);
+const reloadDv = TT.DetailView({ card: archCard, rpc: () => {}, activeAcct: 'acctA', live: null, onBack: () => {} });
+const reloadBtn = flatNodes(reloadDv.children).find((n) => n && n.props && n.props.className === 'ztp-detail-reload');
+check('DetailView：返回栏有「重新读取」（绕过本机缓存）且点击不抛错',
+  Boolean(reloadBtn) && textOf(reloadBtn) === '重新读取'
+  && String(reloadBtn.props.title).includes('跳过本机缓存')
+  && (reloadBtn.props.onClick(), true));
+
+// ── 加载态图标（2026-11-10）：刷新按钮位置改用「静态刷新图标自转」+ 其余加载圈改矢量圆环 ──
+const spinRefresh = TT.RefreshIcon({ className: 'ztp-spin' });
+check('加载态：刷新位置复用 RefreshIcon 并以 ztp-spin 自转（不切形状）',
+  spinRefresh.type === 'svg' && spinRefresh.props.className === 'ztp-spin'
+  && flatNodes(spinRefresh.children).length === 2
+  && flatNodes(spinRefresh.children).every((n) => n.props && n.props.strokeWidth === 1.2));
+const ringSpin = TT.SpinnerIcon({ style: { width: '12px' } });
+const ringCircles = flatNodes(ringSpin.children).filter((n) => n.type === 'circle');
+check('加载圈：SpinnerIcon 是矢量双圆（轨道 + 圆头弧），尺寸可被内联样式覆盖',
+  ringSpin.type === 'svg' && ringSpin.props.className === 'ztp-spin'
+  && ringSpin.props.style.width === '12px'
+  && ringCircles.length === 2
+  && ringCircles[1].props.strokeLinecap === 'round'
+  && String(ringCircles[1].props.strokeDasharray).split(' ').length === 2);
+const spinCssAll = appended.map((s) => s.textContent).join('');
+const spinRule = (spinCssAll.match(/\.ztp-spin\{[^}]*\}/) || [''])[0];
+check('加载圈：CSS 只负责尺寸 + 自转，不再用 conic-gradient/mask/border 画（14px 下会出马赛克颗粒）',
+  spinRule.includes('animation:ztp-rot') && !/conic-gradient|mask:|-webkit-mask|border-top-color/.test(spinRule));
+
+// ── 自转收尾（2026-11-10 用户反馈「动画没有衔接上，突然就复位了」）──
+// 撤掉动画那一刻的角度必须落在整圈上（360°≡0°，与静止态完全一致），否则会回弹。
+const SPIN = TT.SPIN_MS;
+check('收尾：CSS 动画时长与 SPIN_MS 同源', spinRule.includes(`ztp-rot ${SPIN / 1000}s`));
+check('收尾：刚转完一整圈时立刻可停（delay 0）',
+  TT.spinSettleDelay(1000, 1000, SPIN) === 0 && TT.spinSettleDelay(1000, 1000 + SPIN, SPIN) === 0);
+check('收尾：转了一半就等剩下半圈（不停在任意角度）',
+  TT.spinSettleDelay(1000, 1000 + SPIN / 2, SPIN) === SPIN / 2
+  && TT.spinSettleDelay(1000, 1000 + SPIN * 3.25, SPIN) === SPIN * 0.75);
+check('收尾：任意时刻停下时，delayed 之后的角度都是整圈（无回弹）',
+  [1, 137, 450, 899, 1000, 4321, 98765].every((dt) => {
+    const now = 1000 + dt;
+    const at = now + TT.spinSettleDelay(1000, now, SPIN);
+    return (at - 1000) % SPIN === 0;
+  }));
+check('收尾：没有开始时刻（未转过）时直接停，不空转',
+  TT.spinSettleDelay(0, 5000, SPIN) === 0);
+
+const busySlot = TT.RefreshSlot({ busy: true, onRefresh: () => {} });
+const busySvg = flatNodes(busySlot.children)[0];
+check('刷新位：加载中 = span.ztp-tool + 自转的刷新图标（同一颗图标，不换形状）',
+  busySlot.type === 'span' && busySlot.props.className === 'ztp-tool'
+  && busySvg.type === TT.RefreshIcon && busySvg.props.className === 'ztp-spin');
+const idleSlot = TT.RefreshSlot({ busy: false, onRefresh: () => {} });
+check('刷新位：空闲 = 可点的刷新按钮（title/onClick 保留，图标回到静态）',
+  idleSlot.type === 'button' && idleSlot.props.className === 'ztp-tool'
+  && idleSlot.props.title === '重新拉取' && typeof idleSlot.props.onClick === 'function'
+  && flatNodes(idleSlot.children)[0].type === TT.RefreshIcon
+  && flatNodes(idleSlot.children)[0].props === undefined);
+check('刷新位：未配置账号（没有 onRefresh）时不渲染按钮', TT.RefreshSlot({ busy: false, onRefresh: null }) === null);
+
+// ── 本机 Trae 下发（2026-11-23）──
+const dd = TT.DispatchDialog({
+  card: { kind: 'bug', id: 1, title: '测试 Bug' }, images: [], md: '任务背景',
+  intent: 'dispatch', rpc: async () => ({ ok: true, value: { available: true } }),
+  onSend() {}, onClose() {}, activeAcct: 'acct', lazy: false,
+});
+const ddText = flatNodes(dd.children).map(textOf).join('');
+check('处理弹层：出现「执行方式」与「本地 Trae CN」选项',
+  ddText.includes('执行方式') && ddText.includes('本地 Trae CN'));
+TT.saveTraeLast({ target: 'trae', workspaceDir: 'D:\\project\\x' });
+const ddTrae = TT.DispatchDialog({
+  card: { kind: 'bug', id: 1, title: '测试 Bug' }, images: [], md: '任务背景',
+  intent: 'dispatch', rpc: async () => ({ ok: true, value: { available: true } }),
+  onSend() {}, onClose() {}, activeAcct: 'acct', lazy: false,
+});
+const ddTraeText = flatNodes(ddTrae.children).map(textOf).join('');
+check('Trae 工作区：目录输入旁有「选择…」文件选择器',
+  ddTraeText.includes('Trae 工作区目录') && ddTraeText.includes('选择…'));
+TT.saveTraeLast({ target: 'dsh' });
+const ddCase = TT.DispatchDialog({
+  card: { kind: 'task', id: 6534, title: 'goflow 尾款账单优化', storyId: 3628, storyTitle: '现结部分 有尾款的情况' },
+  images: [], md: '需求背景', purpose: 'testcases',
+  intent: 'dispatch', rpc: async () => ({ ok: true, value: { available: true } }),
+  onSend() {}, onClose() {}, activeAcct: 'acct', lazy: false,
+});
+const ddCaseText = flatNodes(ddCase.children).map(textOf).join('');
+check('写用例弹层：标题指向关联需求 + 提示禅道 MCP',
+  ddCaseText.includes('写用例：需求 #3628')
+  && ddCaseText.includes('禅道 MCP')
+  && ddCaseText.includes('发送到 Trae 写用例'));
+const ddAnalysis = TT.DispatchDialog({
+  card: { kind: 'task', id: 6559, title: 'goflow 签约主体优化' },
+  images: [], md: '需求背景', purpose: 'test-analysis',
+  intent: 'dispatch', rpc: async () => ({ ok: true, value: { available: true } }),
+  onSend() {}, onClose() {}, activeAcct: 'acct', lazy: false,
+});
+const ddAnalysisText = flatNodes(ddAnalysis.children).map(textOf).join('');
+check('测试分析弹层：标题/说明/按钮使用分析目的，不动代码',
+  ddAnalysisText.includes('测试分析：任务 #6559')
+  && ddAnalysisText.includes('只生成测试分析')
+  && ddAnalysisText.includes('不修改代码'));
+const ddReview = TT.DispatchDialog({
+  card: { kind: 'story', id: 3688, title: '签约主体新增收款账号' },
+  images: [], md: '需求背景', purpose: 'requirement-review',
+  intent: 'dispatch', rpc: async () => ({ ok: true, value: { available: true } }),
+  onSend() {}, onClose() {}, activeAcct: 'acct', lazy: false,
+});
+const ddReviewText = flatNodes(ddReview.children).map(textOf).join('');
+check('需求分析弹层：标题/说明/按钮使用产品评审目的',
+  ddReviewText.includes('需求分析：需求 #3688')
+  && ddReviewText.includes('只生成需求评审')
+  && ddReviewText.includes('不修改代码'));
+let analysisReq = null;
+const analysisOk = await TT.dispatchToTrae(
+  async (endpoint, payload) => {
+    analysisReq = { endpoint, payload };
+    return { ok: true, value: { workspace: payload.workspaceDir, purpose: payload.purpose } };
+  },
+  'MD', [], { workspaceDir: 'D:\\project\\x', purpose: 'test-analysis' },
+  [{ kind: 'task', id: 6559, title: 't' }], 'acct');
+check('分析下发：purpose=test-analysis + 成功文案带「测试分析」',
+  analysisOk.ok && analysisReq.payload.purpose === 'test-analysis'
+  && analysisOk.message.includes('已发送到 Trae（测试分析）'));
+
+// 测试点清单 + QA 日报（测试模式，本地）
+window.localStorage.removeItem('dsh-zentao-panel.testpoints.v1');
+const tpCard = { kind: 'task', id: 99, title: '测试点样例' };
+TT.saveTestPoints('acct-a', tpCard, [
+  { id: 'tp1', text: '正常流程', status: 'pass' },
+  { id: 'tp2', text: '边界金额', status: 'todo' },
+  { id: 'tp3', text: '权限', status: 'blocked', note: '缺账号' },
+]);
+const tpItems = TT.getTestPoints('acct-a', tpCard);
+const tpStats = TT.testPointsProgress(tpItems);
+const tpMd = TT.testPointsMarkdown(tpCard, tpItems);
+check('测试点：保存/读取/进度/账号隔离',
+  tpItems.length === 3 && tpStats.total === 3 && tpStats.pass === 1
+  && tpStats.blocked === 1 && tpStats.todo === 1 && tpStats.percent === 67
+  && TT.getTestPoints('acct-b', tpCard).length === 0);
+check('测试点：Markdown 含状态与备注',
+  tpMd.includes('- [x] 正常流程（通过）')
+  && tpMd.includes('- [ ] 边界金额（待测）')
+  && tpMd.includes('- [-] 权限（阻塞）')
+  && tpMd.includes('备注：缺账号'));
+const qaCards = [
+  { kind: 'bug', id: 31, title: '待验证 Bug', status: 'resolved', descBrief: 'x', storyId: 1, deadline: '2026-10-20' },
+  { kind: 'task', id: 32, title: '今天到期任务', status: 'active', descBrief: 'x', storyId: 2, deadline: '2026-10-25' },
+  { kind: 'story', id: 33, title: '等你决策需求', status: 'active', descBrief: 'x' },
+];
+const qaText = TT.buildQaDaily(qaCards, (c) => (c.id === 33 ? 'ask' : null), nowTs);
+check('QA 日报：按当前视图汇总待验证/逾期/决策/今天',
+  qaText.includes('禅道 QA 日报') && qaText.includes('共 3 条')
+  && qaText.includes('待验证 Bug（1）') && qaText.includes('逾期（1）')
+  && qaText.includes('等你决策（1）') && qaText.includes('今天到期（1）')
+  && qaText.includes('Bug #31 待验证 Bug'));
+check('QA 日报：空数据也能生成',
+  TT.buildQaDaily([], null, nowTs).includes('共 0 条'));
+let traeReq = null;
+const traeOk = await TT.dispatchToTrae(
+  async (endpoint, payload) => {
+    traeReq = { endpoint, payload };
+    return { ok: true, value: { workspace: payload.workspaceDir, imageCount: payload.images.length } };
+  },
+  'MD', [{ url: 'http://zt/file-read-1.png', name: '1.png' }],
+  { workspaceDir: 'D:\\project\\x', mode: 'agent', reuseWindow: true, planMode: true, purpose: 'testcases' },
+  [{ kind: 'bug', id: 7, title: 't' }], 'acct');
+check('Trae 下发：RPC payload 正确 + 成功文案 + 偏好落盘',
+  traeOk.ok && traeReq && traeReq.endpoint === 'trae.dispatch'
+  && traeReq.payload.workspaceDir === 'D:\\project\\x'
+  && traeReq.payload.mode === 'agent' && traeReq.payload.reuseWindow === true
+  && traeReq.payload.planMode === true
+  && traeReq.payload.purpose === 'testcases'
+  && traeReq.payload.cards[0].id === 7 && traeReq.payload.images.length === 1
+  && traeOk.message.includes('已发送到 Trae（写用例）') && traeOk.message.includes('1 张截图')
+  && traeOk.message.includes('计划模式') && traeOk.message.includes('MCP')
+  && TT.readTraeLast().target === 'trae');
+const traeFail = await TT.dispatchToTrae(
+  async () => ({ ok: false, error: { message: 'Unknown endpoint: trae.dispatch' } }),
+  'MD', [], { workspaceDir: 'D:\\project\\x' }, [{ kind: 'bug', id: 7, title: 't' }], 'acct');
+check('Trae 下发：未知端点转成「重启 DSH」提示',
+  !traeFail.ok && traeFail.message.includes('重启 DSH Desktop'));
+TT.saveTraeLast({ target: 'dsh' });
+
+// ── 开发模式彩蛋：周报（2026-11-25）──
+check('周报 CSS：页头按钮 + 宽弹层样式已声明',
+  cssText.includes('.ztp-weekly-btn{') && cssText.includes('.ztp-weekly-pop{')
+  && cssText.includes('.ztp-weekly-table{') && cssText.includes('.ztp-weekly-foot{'));
+
+const wrWed = TT.weeklyDefaultRange(new Date(2026, 10, 25, 10, 0, 0)); // 2026-11-25 周三
+const wrSun = TT.weeklyDefaultRange(new Date(2026, 10, 29, 23, 0, 0));
+const wrMon = TT.weeklyDefaultRange(new Date(2026, 10, 23, 0, 0, 0));
+check('周报：默认本周一至周日（周三/周日/周一都稳定）',
+  wrWed.start === '2026-11-23' && wrWed.end === '2026-11-29'
+  && wrSun.start === '2026-11-23' && wrSun.end === '2026-11-29'
+  && wrMon.start === '2026-11-23' && wrMon.end === '2026-11-29', JSON.stringify(wrWed));
+
+check('周报：日期校验（非法/倒序/超 31 天/合法）',
+  TT.weeklyValidateRange('2026-11-23', '2026-11-29').ok === true
+  && TT.weeklyValidateRange('2026-11-29', '2026-11-23').ok === false
+  && TT.weeklyValidateRange('2026-11-01', '2026-12-02').ok === false
+  && TT.weeklyValidateRange('2026-02-30', '2026-03-01').ok === false);
+
+const wrDraft = {
+  basicInfo: { reportPeriod: '11月23日 至 11月29日', reporter: '李宏博', department: '研发部', reportDate: '2026/11/25' },
+  overview: '概述',
+  completedWorks: [
+    { objectType: 'task', objectID: 13, title: 'C', consumed: 0.5, projectName: '项目B' },
+    { objectType: 'task', objectID: 12, title: 'A', consumed: 2.5, projectName: '项目A' },
+    { objectType: 'task', objectID: 11, title: 'B', consumed: 1, projectName: '项目A' },
+  ],
+  bugs: [{ id: 31, title: 'bug', status: '已解决' }],
+  summary: '总结',
+  nextWeekPlan: [
+    { title: '计划1', priority: '高' }, { title: '计划2', priority: '中' }, { title: '计划3', priority: '低' },
+  ],
+};
+const wrOverview = TT.weeklyOverview(wrDraft.completedWorks, wrDraft.bugs);
+const wrSummary = TT.weeklySummary(wrDraft.completedWorks, wrDraft.bugs, wrDraft.nextWeekPlan);
+check('周报：概述/总结模板与 host 口径一致',
+  wrOverview === '本周主要围绕 项目B、项目A 展开工作，累计完成 3 项主要任务，处理 1 个 Bug，并持续推进在研需求与交付支持。'
+  && wrSummary === '本周共完成 3 项工作，累计工时 4.0 小时。重点推进了 C、A、B，并处理 1 个 Bug。下周将继续围绕 计划1、计划2 展开。',
+  wrOverview);
+
+const wrMd = TT.weeklyMarkdown(wrDraft);
+check('周报 Markdown：六区块 + 表格 + 工时',
+  ['# 开发周报', '## 一、基本信息', '## 二、工作概述', '## 三、完成的主要工作',
+    '## 四、Bug 修复情况', '## 五、工作总结', '## 六、下周工作计划', '| 序号 | 工作内容 | 工时 |',
+    '| 1 | C | 0.5h |', '| 1 | bug | 已解决 |', '| 3 | 计划3 | 低 |',
+    '- 报告周期：11月23日 至 11月29日'].every((s) => wrMd.includes(s)));
+const wrEmptyMd = TT.weeklyMarkdown({
+  basicInfo: wrDraft.basicInfo, overview: '', completedWorks: [], bugs: [], summary: '', nextWeekPlan: [],
+});
+check('周报 Markdown：空数据用占位行',
+  wrEmptyMd.includes(TT.WEEKLY_EMPTY_TEXT.works) && wrEmptyMd.includes(TT.WEEKLY_EMPTY_TEXT.bugs)
+  && wrEmptyMd.includes(TT.WEEKLY_EMPTY_TEXT.plans));
+
+const wrUpdated = TT.weeklyUpdateWork(wrDraft, 0, 'consumed', '3.5');
+const wrAdded = TT.weeklyAddWork(wrDraft);
+const wrRemoved = TT.weeklyRemoveWork(wrAdded, 3);
+check('周报编辑：工作项改工时/新增/删除（不改原对象）',
+  wrUpdated.completedWorks[0].consumed === 3.5 && wrUpdated.completedWorks[0].title === 'C'
+  && wrDraft.completedWorks[0].consumed === 0.5
+  && wrAdded.completedWorks.length === 4 && wrRemoved.completedWorks.length === 3);
+
+const wrBugUpdated = TT.weeklyUpdateBug(wrDraft, 0, 'id', '99');
+const wrBugAdded = TT.weeklyAddBug(wrDraft);
+const wrBugRemoved = TT.weeklyRemoveBug(wrBugAdded, 1);
+check('周报编辑：Bug 改 ID/新增/删除',
+  wrBugUpdated.bugs[0].id === 99 && wrBugAdded.bugs.length === 2 && wrBugRemoved.bugs.length === 1);
+
+const wrPlanUpdated = TT.weeklyUpdatePlan(wrDraft, 0, 'priority', '低');
+const wrPlanAdded = TT.weeklyAddPlan(wrDraft);
+const wrPlanRemoved = TT.weeklyRemovePlan(wrPlanAdded, 3);
+check('周报编辑：计划改优先级/新增/删除',
+  wrPlanUpdated.nextWeekPlan[0].priority === '低'
+  && wrPlanAdded.nextWeekPlan.length === 4 && wrPlanRemoved.nextWeekPlan.length === 3);
+
+check('周报：重新生成概述/总结使用当前编辑内容',
+  TT.weeklyRegenerate(wrUpdated, 'overview').overview === TT.weeklyOverview(wrUpdated.completedWorks, wrUpdated.bugs)
+  && TT.weeklyRegenerate(wrPlanUpdated, 'summary').summary === TT.weeklySummary(wrDraft.completedWorks, wrDraft.bugs, wrPlanUpdated.nextWeekPlan));
+
+const wrPayload = TT.weeklyExportPayload(Object.assign({}, wrDraft, { warnings: ['w'] }), 'D:\\out');
+check('周报导出 payload：只带六区块（去 warnings）+ 可选 outputDir',
+  wrPayload.draft.warnings === undefined && Object.keys(wrPayload.draft).length === 6
+  && wrPayload.outputDir === 'D:\\out'
+  && TT.weeklyExportPayload(wrDraft, '').outputDir === undefined);
+
+check('周报入口：仅开发模式 + 已登录显示',
+  TT.showWeeklyEntry({ configured: true }, 'dev') === true
+  && TT.showWeeklyEntry({ configured: true }, 'test') === false
+  && TT.showWeeklyEntry({ configured: true }, 'product') === false
+  && TT.showWeeklyEntry({ configured: false }, 'dev') === false
+  && TT.showWeeklyEntry(null, 'dev') === false);
+
+const wrNorm = TT.normalizeWeeklyDraft({ basicInfo: {}, warnings: 'bad' });
+check('周报：host 返回缺字段时归一（数组/文本/警告兜底）',
+  wrNorm.completedWorks.length === 0 && wrNorm.bugs.length === 0 && wrNorm.nextWeekPlan.length === 0
+  && wrNorm.overview === '' && wrNorm.warnings.length === 0 && wrNorm.basicInfo.department === '研发部');
+
+// 弹层静态渲染 + 生成请求 payload
+const wrRpcs = [];
+const wrDialog = TT.WeeklyReportDialog({
+  rpc: async (endpoint, payload) => { wrRpcs.push({ endpoint, payload }); return { ok: true, value: wrDraft }; },
+  onClose: () => {}, toast: () => {},
+});
+const wrNodes = walkAll([wrDialog]);
+const wrText = wrNodes.map(textOf).join('');
+const wrDateInputs = wrNodes.filter((n) => n && n.props && n.props.type === 'date');
+const wrGenerateBtn = wrNodes.find((n) => n && n.type === 'button' && n.props && String(n.props.title).includes('按该时间范围生成周报'));
+check('周报弹层：标题/日期范围/生成与导出按钮齐全',
+  wrText.includes('✨ 生成周报') && wrText.includes('开始日期') && wrText.includes('结束日期')
+  && wrText.includes('生成周报') && wrText.includes('复制 Markdown') && wrText.includes('导出 Word')
+  && wrDateInputs.length === 2
+  && wrDateInputs[0].props.value === wrWed.start && wrDateInputs[1].props.value === wrWed.end);
+check('周报弹层：草稿为空时复制/导出禁用', (() => {
+  const copyBtn = wrNodes.find((n) => n && n.type === 'button' && textOf(n) === '复制 Markdown');
+  const expBtn = wrNodes.find((n) => n && n.type === 'button' && textOf(n) === '导出 Word');
+  return copyBtn && copyBtn.props.disabled === true && expBtn && expBtn.props.disabled === true;
+})());
+wrGenerateBtn.props.onClick();
+await new Promise((r) => setTimeout(r, 0));
+const wrCall = wrRpcs.find((c) => c.endpoint === 'zentao.weekly');
+check('周报弹层：生成调用 zentao.weekly（默认本周 payload）',
+  Boolean(wrCall) && wrCall.payload.start === wrWed.start && wrCall.payload.end === wrWed.end, JSON.stringify(wrCall));
+
+console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
+process.exit(failures ? 1 : 0);
